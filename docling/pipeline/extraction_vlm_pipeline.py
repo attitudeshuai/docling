@@ -25,6 +25,7 @@ from docling.datamodel.extraction import (
     ExtractionResult,
     ExtractionTemplateType,
 )
+from docling.datamodel.extraction_options import ExtractionMergeOptions
 from docling.datamodel.pipeline_options import (
     PipelineOptions,
     VlmExtractionPipelineOptions,
@@ -58,8 +59,14 @@ class ExtractionVlmPipeline(BaseExtractionPipeline):
         self,
         ext_res: ExtractionResult,
         template: Optional[ExtractionTemplateType] = None,
+        merge_options: Optional[ExtractionMergeOptions] = None,
     ) -> ExtractionResult:
         """Extract data using the VLM model."""
+        max_page_retries = (
+            merge_options.max_page_retries
+            if merge_options is not None and merge_options.enabled
+            else 0
+        )
         try:
             images = self._get_images_from_input(ext_res.input)
             if template is not None:
@@ -72,43 +79,14 @@ class ExtractionVlmPipeline(BaseExtractionPipeline):
             try:
                 for page_number, image in images:
                     processed_image = True
-                    try:
-                        predictions = list(
-                            self.vlm_model.process_images([image], prompt)
-                        )
-                        if predictions:
-                            extracted_text = predictions[0].text
-                            extracted_data = None
-                            vlm_stop_reason: VlmStopReason = predictions[0].stop_reason
-                            if vlm_stop_reason in {
-                                VlmStopReason.LENGTH,
-                                VlmStopReason.STOP_SEQUENCE,
-                            }:
-                                ext_res.status = ConversionStatus.PARTIAL_SUCCESS
-
-                            try:
-                                extracted_data = json.loads(extracted_text)
-                            except (json.JSONDecodeError, ValueError):
-                                pass
-
-                            page_data = ExtractedPageData(
-                                page_no=page_number,
-                                extracted_data=extracted_data,
-                                raw_text=extracted_text,
-                            )
-                        else:
-                            page_data = ExtractedPageData(
-                                page_no=page_number,
-                                extracted_data=None,
-                                errors=["No extraction result from VLM model"],
-                            )
-                    except Exception as e:
-                        _log.error(f"Error processing page {page_number}: {e}")
-                        page_data = ExtractedPageData(
-                            page_no=page_number,
-                            extracted_data=None,
-                            errors=[str(e)],
-                        )
+                    page_data, truncated = self._extract_single_page(
+                        page_number=page_number,
+                        image=image,
+                        prompt=prompt,
+                        max_retries=max_page_retries,
+                    )
+                    if truncated:
+                        ext_res.status = ConversionStatus.PARTIAL_SUCCESS
                     ext_res.pages.append(page_data)
 
                     timeout = self.pipeline_options.document_timeout
@@ -157,6 +135,72 @@ class ExtractionVlmPipeline(BaseExtractionPipeline):
             )
 
         return ext_res
+
+    def _extract_single_page(
+        self,
+        page_number: int,
+        image: Image,
+        prompt: str,
+        max_retries: int,
+    ) -> tuple[ExtractedPageData, bool]:
+        """Run the VLM on one page, retrying at most ``max_retries`` times.
+
+        Retries reuse the already-rendered page image. A page that keeps
+        failing returns exactly one error (from the last attempt) together
+        with the attempt count, so it can be excluded from merging without
+        affecting other pages.
+
+        Returns:
+            The page data and whether the model output was truncated.
+        """
+        attempts = 0
+        last_error = "No extraction result from VLM model"
+        while True:
+            attempts += 1
+            truncated = False
+            try:
+                predictions = list(self.vlm_model.process_images([image], prompt))
+                if predictions:
+                    extracted_text = predictions[0].text
+                    vlm_stop_reason: VlmStopReason = predictions[0].stop_reason
+                    truncated = vlm_stop_reason in {
+                        VlmStopReason.LENGTH,
+                        VlmStopReason.STOP_SEQUENCE,
+                    }
+
+                    extracted_data = None
+                    try:
+                        extracted_data = json.loads(extracted_text)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+                    return (
+                        ExtractedPageData(
+                            page_no=page_number,
+                            extracted_data=extracted_data,
+                            raw_text=extracted_text,
+                            attempts=attempts,
+                        ),
+                        truncated,
+                    )
+                last_error = "No extraction result from VLM model"
+            except Exception as e:
+                _log.error(
+                    f"Error processing page {page_number} "
+                    f"(attempt {attempts}/{max_retries + 1}): {e}"
+                )
+                last_error = str(e)
+
+            if attempts > max_retries:
+                return (
+                    ExtractedPageData(
+                        page_no=page_number,
+                        extracted_data=None,
+                        errors=[last_error],
+                        attempts=attempts,
+                    ),
+                    False,
+                )
 
     def _determine_status(self, ext_res: ExtractionResult) -> ConversionStatus:
         """Determine the status based on extraction results."""

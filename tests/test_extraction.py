@@ -311,7 +311,7 @@ def test_extraction_pipeline_failure_is_categorized() -> None:
     from docling.pipeline.base_extraction_pipeline import BaseExtractionPipeline
 
     class _FailingPipeline(BaseExtractionPipeline):
-        def _extract_data(self, ext_res, template=None):
+        def _extract_data(self, ext_res, template=None, merge_options=None):
             raise RuntimeError("boom")
 
         def _determine_status(self, ext_res):

@@ -32,6 +32,7 @@ from docling.datamodel.document import (
     build_invalid_input_errors,
 )
 from docling.datamodel.extraction import ExtractionResult, ExtractionTemplateType
+from docling.datamodel.extraction_options import ExtractionMergeOptions
 from docling.datamodel.pipeline_options import PipelineOptions
 from docling.datamodel.settings import (
     DEFAULT_PAGE_RANGE,
@@ -136,6 +137,7 @@ class DocumentExtractor:
         max_num_pages: int = sys.maxsize,
         max_file_size: int = sys.maxsize,
         page_range: PageRange = DEFAULT_PAGE_RANGE,
+        merge_options: Optional[ExtractionMergeOptions] = None,
     ) -> ExtractionResult:
         all_res = self.extract_all(
             source=[source],
@@ -145,6 +147,7 @@ class DocumentExtractor:
             max_file_size=max_file_size,
             page_range=page_range,
             template=template,
+            merge_options=merge_options,
         )
         return next(all_res)
 
@@ -158,6 +161,7 @@ class DocumentExtractor:
         max_num_pages: int = sys.maxsize,
         max_file_size: int = sys.maxsize,
         page_range: PageRange = DEFAULT_PAGE_RANGE,
+        merge_options: Optional[ExtractionMergeOptions] = None,
     ) -> Iterator[ExtractionResult]:
         limits = DocumentLimits(
             max_num_pages=max_num_pages,
@@ -169,7 +173,10 @@ class DocumentExtractor:
         )
 
         ext_res_iter = self._extract(
-            conv_input, raises_on_error=raises_on_error, template=template
+            conv_input,
+            raises_on_error=raises_on_error,
+            template=template,
+            merge_options=merge_options,
         )
 
         had_result = False
@@ -201,6 +208,7 @@ class DocumentExtractor:
         conv_input: _DocumentConversionInput,
         raises_on_error: bool,
         template: ExtractionTemplateType,
+        merge_options: Optional[ExtractionMergeOptions] = None,
     ) -> Iterator[ExtractionResult]:
         start_time = time.monotonic()
 
@@ -213,6 +221,7 @@ class DocumentExtractor:
                 self._process_document_extraction,
                 raises_on_error=raises_on_error,
                 template=template,
+                merge_options=merge_options,
             )
 
             if (
@@ -244,13 +253,17 @@ class DocumentExtractor:
         in_doc: InputDocument,
         raises_on_error: bool,
         template: ExtractionTemplateType,
+        merge_options: Optional[ExtractionMergeOptions] = None,
     ) -> ExtractionResult:
         valid = (
             self.allowed_formats is not None and in_doc.format in self.allowed_formats
         )
         if valid:
             return self._execute_extraction_pipeline(
-                in_doc, raises_on_error=raises_on_error, template=template
+                in_doc,
+                raises_on_error=raises_on_error,
+                template=template,
+                merge_options=merge_options,
             )
         else:
             error_message = f"File format not allowed: {in_doc.file}"
@@ -269,6 +282,7 @@ class DocumentExtractor:
         in_doc: InputDocument,
         raises_on_error: bool,
         template: ExtractionTemplateType,
+        merge_options: Optional[ExtractionMergeOptions] = None,
     ) -> ExtractionResult:
         if not in_doc.valid:
             return ExtractionResult(
@@ -287,7 +301,10 @@ class DocumentExtractor:
                 return ExtractionResult(input=in_doc, status=ConversionStatus.FAILURE)
 
         return pipeline.execute(
-            in_doc, raises_on_error=raises_on_error, template=template
+            in_doc,
+            raises_on_error=raises_on_error,
+            template=template,
+            merge_options=merge_options,
         )
 
     def _get_pipeline(

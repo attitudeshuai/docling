@@ -14,8 +14,10 @@ from docling.datamodel.base_models import (
 )
 from docling.datamodel.document import InputDocument
 from docling.datamodel.extraction import ExtractionResult, ExtractionTemplateType
+from docling.datamodel.extraction_options import ExtractionMergeOptions
 from docling.datamodel.pipeline_options import BaseOptions, PipelineOptions
 from docling.datamodel.settings import settings
+from docling.utils.extraction_merge import merge_page_results
 
 _log = logging.getLogger(__name__)
 
@@ -41,12 +43,26 @@ class BaseExtractionPipeline(ABC):
         in_doc: InputDocument,
         raises_on_error: bool,
         template: Optional[ExtractionTemplateType] = None,
+        merge_options: Optional[ExtractionMergeOptions] = None,
     ) -> ExtractionResult:
         ext_res = ExtractionResult(input=in_doc)
 
         try:
-            ext_res = self._extract_data(ext_res, template)
+            ext_res = self._extract_data(ext_res, template, merge_options)
             ext_res.status = self._determine_status(ext_res)
+
+            if merge_options is not None and merge_options.enabled:
+                # The raw per-page results stay the source of truth; the merge
+                # is an additional, purely derived document-level view.
+                ext_res.merged = merge_page_results(
+                    pages=ext_res.pages,
+                    template=template,
+                    options=merge_options,
+                )
+                if ext_res.merged.status == ConversionStatus.FAILURE:
+                    ext_res.status = ConversionStatus.FAILURE
+                elif ext_res.merged.status == ConversionStatus.PARTIAL_SUCCESS:
+                    ext_res.status = ConversionStatus.PARTIAL_SUCCESS
         except Exception as e:
             ext_res.status = ConversionStatus.FAILURE
             error_item = ErrorItem(
@@ -66,6 +82,7 @@ class BaseExtractionPipeline(ABC):
         self,
         ext_res: ExtractionResult,
         template: Optional[ExtractionTemplateType] = None,
+        merge_options: Optional[ExtractionMergeOptions] = None,
     ) -> ExtractionResult:
         """Subclass must populate ext_res.pages/errors and return the result."""
         raise NotImplementedError
