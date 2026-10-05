@@ -111,6 +111,12 @@ from docling.pipeline.simple_pipeline import SimplePipeline
 from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
 from docling.pipeline.video_pipeline import VideoPipeline
 from docling.utils.pipeline_cache import create_pipeline_options_hash
+from docling.utils.result_cache import (
+    ConversionResultCacheOptions,
+    ConversionResultStore,
+    ResultCacheGate,
+    create_cache_fingerprint,
+)
 from docling.utils.utils import chunkify
 
 _log = logging.getLogger(__name__)
@@ -445,6 +451,7 @@ class DocumentConverter:
         self,
         allowed_formats: Optional[list[InputFormat]] = None,
         format_options: Optional[dict[InputFormat, FormatOption]] = None,
+        result_cache_options: Optional[ConversionResultCacheOptions] = None,
     ) -> None:
         """Initialize the converter based on format preferences.
 
@@ -452,6 +459,14 @@ class DocumentConverter:
             allowed_formats: List of allowed input formats. By default, any
                 format supported by Docling is allowed.
             format_options: Dictionary of format-specific options.
+            result_cache_options: Configuration of the persistent conversion
+                result cache. By default the cache is disabled and behavior is
+                identical to running without it. When enabled, conversion
+                results (including failures produced with
+                ``raises_on_error=False``) are keyed by input content together
+                with the effective pipeline/backend options, limits and page
+                range, and reused across processes from the configured cache
+                directory. See :class:`ConversionResultCacheOptions`.
 
         Examples:
             Create a converter with default settings (all formats allowed):
@@ -516,6 +531,21 @@ class DocumentConverter:
         self.initialized_pipelines: dict[
             tuple[Type[BasePipeline], str], BasePipeline
         ] = {}
+
+        # Persistent conversion result ledger. Stays ``None`` unless
+        # explicitly enabled, in which case the store probes its directory
+        # once and degrades (with one warning) to recompute-only if it cannot
+        # be written. The gate owns the in-process single-flight dedup.
+        self._result_store: Optional[ConversionResultStore] = (
+            ConversionResultStore(result_cache_options)
+            if result_cache_options is not None and result_cache_options.enabled
+            else None
+        )
+        self._result_cache_gate: Optional[ResultCacheGate] = (
+            ResultCacheGate(self._result_store)
+            if self._result_store is not None and self._result_store.available
+            else None
+        )
 
     def _get_initialized_pipelines(
         self,
@@ -843,7 +873,9 @@ class DocumentConverter:
             self.allowed_formats is not None and in_doc.format in self.allowed_formats
         )
         if valid:
-            conv_res = self._execute_pipeline(in_doc, raises_on_error=raises_on_error)
+            conv_res = self._execute_pipeline_cached(
+                in_doc, raises_on_error=raises_on_error
+            )
         else:
             error_message = f"File format not allowed: {in_doc.file}"
             error_item = ErrorItem(
@@ -862,6 +894,48 @@ class DocumentConverter:
         backend = getattr(in_doc, "_backend", None)
         if backend is not None:
             backend.unload()
+
+    def _execute_pipeline_cached(
+        self, in_doc: InputDocument, raises_on_error: bool
+    ) -> ConversionResult:
+        """Run the pipeline, reusing a cached result when one is still valid.
+
+        Falls back to :meth:`_execute_pipeline` whenever the cache is
+        disabled/unavailable or the fingerprint cannot be computed, so cache
+        problems never alter conversion behavior beyond an extra log line.
+        """
+        gate = self._result_cache_gate
+        if gate is None or not in_doc.valid:
+            return self._execute_pipeline(in_doc, raises_on_error=raises_on_error)
+
+        format_option = self.format_to_options.get(in_doc.format)
+        if format_option is None or format_option.pipeline_options is None:
+            return self._execute_pipeline(in_doc, raises_on_error=raises_on_error)
+
+        try:
+            fingerprint = create_cache_fingerprint(
+                in_doc=in_doc,
+                pipeline_class=format_option.pipeline_cls,
+                pipeline_options=format_option.pipeline_options,
+            )
+        except Exception as exc:
+            _log.warning(
+                "Could not compute the conversion result cache fingerprint for "
+                "%s: %s; converting without caching.",
+                in_doc.file,
+                exc,
+            )
+            return self._execute_pipeline(in_doc, raises_on_error=raises_on_error)
+
+        return gate.execute(
+            in_doc=in_doc,
+            fingerprint=fingerprint,
+            raises_on_error=raises_on_error,
+            run_pipeline=lambda: self._execute_pipeline(
+                in_doc, raises_on_error=raises_on_error
+            ),
+            release_input=self._unload_input_document,
+        )
 
     def _execute_pipeline(
         self, in_doc: InputDocument, raises_on_error: bool
