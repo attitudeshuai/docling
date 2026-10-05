@@ -7,6 +7,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Type
 
 from docling_core.types.doc import (
     BoundingBox,
@@ -432,3 +433,7 @@ class NativePdfPipeline(ConvertPipeline):
     @classmethod
     def is_backend_supported(cls, backend: AbstractDocumentBackend) -> bool:
         return isinstance(backend, PdfDocumentBackend)
+
+    @classmethod
+    def supports_backend_class(cls, backend_cls: Type[AbstractDocumentBackend]) -> bool:
+        return issubclass(backend_cls, PdfDocumentBackend)

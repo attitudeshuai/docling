@@ -21,6 +21,16 @@ class DocumentLoadError(ConversionError):
     """
 
 
+class BackendChainExhaustedError(DocumentLoadError):
+    """Every backend in a per-document fallback chain rejected or failed.
+
+    Raised by a fallback backend after each declared candidate has been tried
+    for the document. The message enumerates every link and the reason it was
+    excluded, and ``__cause__`` chains the last underlying backend error so
+    callers keep classifying failures exactly as with a single backend.
+    """
+
+
 class OperationNotAllowed(BaseError):
     pass
 

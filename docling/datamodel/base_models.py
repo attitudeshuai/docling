@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: The Docling Contributors
 # SPDX-License-Identifier: MIT
 
+import inspect
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
@@ -41,9 +42,9 @@ from pydantic import (
 
 if TYPE_CHECKING:
     from docling.backend.pdf_backend import PdfPageBackend
-    from docling.datamodel.backend_options import BackendOptions
 
 from docling.backend.abstract_backend import AbstractDocumentBackend
+from docling.datamodel.backend_options import BackendOptions
 from docling.datamodel.pipeline_options import PipelineOptions
 
 
@@ -355,6 +356,134 @@ class ErrorItem(BaseModel):
     error_message: str
     category: FailureCategory = FailureCategory.UNKNOWN
     page_no: int | None = None
+
+
+class BackendAttemptStatus(str, Enum):
+    """Outcome of one backend in a per-document fallback chain.
+
+    - ``SELECTED``: the backend effectively parsed (part of) the document.
+    - ``SKIPPED``: the backend was never used because it was unavailable for
+      this document (missing dependency, load failure, invalid content).
+    - ``FAILED``: the backend was in use but failed mid-document and the next
+      candidate took over the pages it did not serve.
+    """
+
+    SELECTED = "selected"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+class BackendExclusionReason(str, Enum):
+    """Why a chain link was skipped or abandoned while processing one document."""
+
+    DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
+    LOAD_FAILED = "load_failed"
+    INVALID_FOR_DOCUMENT = "invalid_for_document"
+    PAGE_PROCESSING_FAILED = "page_processing_failed"
+    CONVERSION_FAILED = "conversion_failed"
+
+
+class BackendCapabilities(BaseModel):
+    """Capabilities declared for (and verified against) a backend class.
+
+    Capabilities describe what a backend can do independently of a concrete
+    document, so the converter layer can validate an ordered fallback chain
+    before any document is processed.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    pagination: bool = Field(
+        default=False,
+        description="Whether the backend exposes a page count and per-page access.",
+    )
+    text_cells: bool = Field(
+        default=False,
+        description="Whether the backend exposes page-level text cells.",
+    )
+
+    @classmethod
+    def from_backend_class(
+        cls, backend_cls: Type[AbstractDocumentBackend]
+    ) -> "BackendCapabilities":
+        """Derive the capability facts reported by a backend class itself."""
+        # Imported lazily: pdf_backend imports from this module.
+        from docling.backend.pdf_backend import PdfDocumentBackend
+
+        return cls(
+            pagination=backend_cls.supports_pagination(),
+            text_cells=issubclass(backend_cls, PdfDocumentBackend),
+        )
+
+
+class BackendAttempt(BaseModel):
+    """One entry of the per-document backend fallback trace.
+
+    Mirrors the order in which backends were tried for a single document and
+    records which one effectively served which pages and why every other link
+    was excluded.
+    """
+
+    backend: str = Field(description="Class name of the tried backend.")
+    status: BackendAttemptStatus
+    reason: Optional[BackendExclusionReason] = None
+    detail: Optional[str] = None
+    served_pages: list[int] = Field(
+        default_factory=list,
+        description="1-based page numbers effectively served by this backend.",
+    )
+
+
+class BackendChainEntry(BaseModel):
+    """One backend link of an ordered per-format fallback chain.
+
+    ``capabilities`` may be omitted, in which case they are derived from the
+    backend class. When declared, they must match the facts reported by the
+    class; mismatches are rejected while validating the chain.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    backend: Type[AbstractDocumentBackend]
+    backend_options: Optional[BackendOptions] = None
+    capabilities: Optional[BackendCapabilities] = None
+
+    @property
+    def resolved_capabilities(self) -> BackendCapabilities:
+        """Declared capabilities, or the facts derived from the backend class."""
+        return self.capabilities or BackendCapabilities.from_backend_class(self.backend)
+
+    @model_validator(mode="after")
+    def _validate_backend_reference(self) -> "BackendChainEntry":
+        backend_cls = self.backend
+        if not isinstance(backend_cls, type) or not issubclass(
+            backend_cls, AbstractDocumentBackend
+        ):
+            raise ValueError(
+                "Unknown backend in fallback chain: expected a concrete "
+                f"AbstractDocumentBackend subclass, got {backend_cls!r}."
+            )
+        if inspect.isabstract(backend_cls):
+            raise ValueError(
+                f"Backend {backend_cls.__name__} is abstract and cannot be used "
+                "in a fallback chain."
+            )
+
+        if self.capabilities is not None:
+            actual = BackendCapabilities.from_backend_class(backend_cls)
+            mismatches = [
+                name
+                for name in ("pagination", "text_cells")
+                if getattr(self.capabilities, name) != getattr(actual, name)
+            ]
+            if mismatches:
+                declared = self.capabilities.model_dump()
+                raise ValueError(
+                    f"Declared capabilities for backend {backend_cls.__name__} "
+                    f"contradict the backend implementation for {mismatches}: "
+                    f"declared {declared}, actual {actual.model_dump()}."
+                )
+        return self
 
 
 class Cluster(BaseModel):

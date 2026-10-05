@@ -9,7 +9,7 @@ import re
 import sys
 import tarfile
 import zipfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from enum import Enum
 from io import BytesIO
@@ -60,6 +60,8 @@ from docling.datamodel.backend_options import (
 )
 from docling.datamodel.base_models import (
     AssembledUnit,
+    BackendAttempt,
+    BackendChainEntry,
     ConfidenceReport,
     ConversionStatus,
     DoclingComponentType,
@@ -80,7 +82,7 @@ from docling.utils.profiling import ProfilingItem
 from docling.utils.utils import create_file_hash, safe_version
 
 if TYPE_CHECKING:
-    from docling.datamodel.base_models import BaseFormatOption
+    from docling.document_converter import FormatOption
 
 _log = logging.getLogger(__name__)
 
@@ -161,6 +163,7 @@ class InputDocument(BaseModel):
         backend_options: Optional[BackendOptions] = None,
         filename: Optional[str] = None,
         limits: Optional[DocumentLimits] = None,
+        backend_chain: Optional[Sequence[BackendChainEntry]] = None,
     ) -> None:
         super().__init__(
             file="",
@@ -179,7 +182,7 @@ class InputDocument(BaseModel):
                     self._reject_filesize()
                 else:
                     self.document_hash = create_file_hash(path_or_stream)
-                    self._init_doc(backend, path_or_stream)
+                    self._init_doc(backend, path_or_stream, backend_chain)
 
             elif isinstance(path_or_stream, BytesIO):
                 assert filename is not None, (
@@ -193,7 +196,7 @@ class InputDocument(BaseModel):
                     self._reject_filesize()
                 else:
                     self.document_hash = create_file_hash(path_or_stream)
-                    self._init_doc(backend, path_or_stream)
+                    self._init_doc(backend, path_or_stream, backend_chain)
             else:
                 raise RuntimeError(
                     f"Unexpected type path_or_stream: {type(path_or_stream)}"
@@ -304,9 +307,31 @@ class InputDocument(BaseModel):
         self,
         backend: Type[AbstractDocumentBackend],
         path_or_stream: Union[BytesIO, Path],
+        backend_chain: Optional[Sequence[BackendChainEntry]] = None,
     ) -> None:
         try:
-            if self.backend_options:
+            if backend_chain is not None:
+                # Imported lazily: fallback_backend pulls in pdf_backend, which
+                # imports this module at load time.
+                from docling.backend.fallback_backend import make_fallback_backend
+
+                # The wrapper instantiates each chain candidate itself
+                # (rewinding the stream between attempts); candidate options
+                # travel in the chain entries.
+                try:
+                    self._backend = make_fallback_backend(
+                        in_doc=self,
+                        path_or_stream=path_or_stream,
+                        entries=backend_chain,
+                    )
+                except ValueError as exc:
+                    # Defensive: configuration validation in the converter
+                    # rejects mixed/empty chains earlier, but a directly
+                    # constructed InputDocument must still fail as BACKEND_FAILURE.
+                    raise DocumentLoadError(
+                        f"Invalid backend fallback chain configuration: {exc}"
+                    ) from exc
+            elif self.backend_options:
                 self._backend = backend(
                     self,
                     path_or_stream=path_or_stream,
@@ -331,10 +356,22 @@ class InputDocument(BaseModel):
 
         if not self._backend.is_valid():
             self.valid = False
-            self._rejection = InputRejection(
-                message="The document backend could not parse the input.",
-                category=FailureCategory.BACKEND_FAILURE,
-            )
+            from docling.backend.fallback_backend import get_chain_failure
+
+            chain_failure = get_chain_failure(self._backend)
+            if chain_failure is not None:
+                # Every backend in a declared fallback chain was unavailable or
+                # failed; keep the per-link reasons and the underlying cause.
+                self._rejection = InputRejection(
+                    message=str(chain_failure),
+                    category=FailureCategory.BACKEND_FAILURE,
+                    original_error=chain_failure,
+                )
+            else:
+                self._rejection = InputRejection(
+                    message="The document backend could not parse the input.",
+                    category=FailureCategory.BACKEND_FAILURE,
+                )
 
 
 def get_input_rejection_cause(in_doc: "InputDocument") -> Optional[BaseException]:
@@ -591,6 +628,12 @@ class ConversionResult(ConversionAssets):
     input: InputDocument
     assembled: AssembledUnit = AssembledUnit()
 
+    # Ordered per-document trace of the backend fallback chain: which backends
+    # were tried, which one effectively served the document (and which pages),
+    # and why every excluded link was skipped or abandoned. Empty when no
+    # fallback chain is declared.
+    backend_attempts: list[BackendAttempt] = Field(default_factory=list)
+
     # PDF bookmark/ToC outline, surfaced from the backend for the heading-hierarchy stage.
     # Private transient plumbing: a Pydantic private attr (not a model field, never serialized);
     # the heading stage resets it to None once consumed.
@@ -622,8 +665,7 @@ class _DocumentConversionInput(BaseModel):
     limits: Optional[DocumentLimits] = DocumentLimits()
 
     def docs(
-        self,
-        format_options: Mapping[InputFormat, "BaseFormatOption"],
+        self, format_options: Mapping[InputFormat, "FormatOption"]
     ) -> Iterable[InputDocument]:
         for item in self.path_or_stream_iterator:
             # `backend_input` is what backend_options_for_input() sees: the raw
@@ -682,6 +724,7 @@ class _DocumentConversionInput(BaseModel):
             format = self._guess_format(obj)
             backend: Type[AbstractDocumentBackend]
             backend_options: Optional[BackendOptions] = None
+            backend_chain: Optional[list[BackendChainEntry]] = None
             if not format or format not in format_options:
                 _log.error(
                     f"Input document {obj.name} with format {format} does not match "
@@ -692,6 +735,13 @@ class _DocumentConversionInput(BaseModel):
                 options = format_options[format]
                 backend = options.backend
                 backend_options = options.backend_options_for_input(backend_input)
+                if options.fallback_backends:
+                    chain = options.backend_chain
+                    # The primary entry carries the per-input resolved options.
+                    primary_entry = chain[0].model_copy(
+                        update={"backend_options": backend_options}
+                    )
+                    backend_chain = [primary_entry, *chain[1:]]
 
             path_or_stream: Union[BytesIO, Path]
             if isinstance(obj, Path):
@@ -708,12 +758,13 @@ class _DocumentConversionInput(BaseModel):
                 limits=self.limits,
                 backend=backend,
                 backend_options=backend_options,
+                backend_chain=backend_chain,
             )
 
     def _build_invalid_input_document(
         self,
         name: str,
-        format_options: Mapping[InputFormat, "BaseFormatOption"],
+        format_options: Mapping[InputFormat, "FormatOption"],
         file_size: int = 0,
         rejection: Optional[InputRejection] = None,
     ) -> InputDocument:

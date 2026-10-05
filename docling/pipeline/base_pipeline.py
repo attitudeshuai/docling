@@ -8,7 +8,7 @@ import traceback
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Type
 
 from docling_core.types.doc import ContentLayer, DocItem, DoclingDocument, NodeItem
 
@@ -199,6 +199,17 @@ class BasePipeline(ABC):
     @abstractmethod
     def is_backend_supported(cls, backend: AbstractDocumentBackend):
         pass
+
+    @classmethod
+    def supports_backend_class(cls, backend_cls: Type[AbstractDocumentBackend]) -> bool:
+        """Whether this pipeline can drive backends of ``backend_cls``.
+
+        Class-level counterpart of :meth:`is_backend_supported`, used to reject
+        invalid fallback chains before any document is processed. The default
+        accepts any backend so custom pipelines keep working; built-in
+        pipelines override it with their actual backend protocol.
+        """
+        return True
 
 
 class ConvertPipeline(BasePipeline):

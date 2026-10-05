@@ -220,6 +220,55 @@ docling --pipeline native --from pdf --parser-threads 8 FILE
 ```
 
 
+### Backend fallback chains
+
+When a PDF (or any other format) cannot be parsed by the default backend, the
+converter can try additional backends in a declared order. Fallback is decided
+per document, so concurrent conversions never influence each other.
+
+```python
+from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+from docling.datamodel.base_models import BackendChainEntry, InputFormat
+from docling.document_converter import DocumentConverter, PdfFormatOption
+
+converter = DocumentConverter(
+    format_options={
+        InputFormat.PDF: PdfFormatOption(
+            fallback_backends=[
+                BackendChainEntry(backend=PyPdfiumDocumentBackend),
+            ],
+        )
+    }
+)
+result = converter.convert("paper.pdf")
+```
+
+A backend is skipped when its optional dependency is missing or it rejects the
+file, and a later backend takes over a page when parsing it fails mid-document.
+Pages already produced are never re-parsed by the next backend: the final page
+numbering stays contiguous and each page is attributed to exactly one backend.
+Each link can carry its own `backend_options`; capabilities (pagination, text
+cells) may be declared with `BackendCapabilities` and are otherwise derived
+from the backend class. Unknown backends, duplicate links, backends that do not
+support the format or are incompatible with the format's pipeline, and
+capability mismatches raise while the `DocumentConverter` is constructed.
+
+`result.backend_attempts` lists, in order, every tried backend, whether it was
+effectively used or skipped/failed, the reason and detail, and the 1-based page
+numbers it served:
+
+```python
+for attempt in result.backend_attempts:
+    print(attempt.backend, attempt.status, attempt.reason, attempt.served_pages)
+```
+
+If every backend fails for a document, the conversion fails with the same
+status/exception semantics as with a single backend; the error items and the
+attempt trace state the reason each link was excluded. When
+`fallback_backends` is not declared, conversion behaves exactly as before and
+`backend_attempts` stays empty.
+
+
 ### Recover PDF heading levels
 
 The layout model marks section headers but not how deep they sit, so by default every heading in a

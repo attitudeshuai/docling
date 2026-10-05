@@ -31,6 +31,10 @@ from docling.backend.docling_parse_backend import (
 from docling.backend.ebcdic_backend import EbcdicDocumentBackend
 from docling.backend.email_backend import EmailDocumentBackend
 from docling.backend.epub_backend import EpubDocumentBackend
+from docling.backend.fallback_backend import (
+    get_backend_attempts,
+    validate_backend_chain,
+)
 from docling.backend.html_backend import HTMLDocumentBackend
 from docling.backend.image_backend import ImageDocumentBackend
 from docling.backend.iwork_backend import (
@@ -76,6 +80,9 @@ from docling.datamodel.backend_options import (
     XBRLBackendOptions,
 )
 from docling.datamodel.base_models import (
+    BackendAttemptStatus,
+    BackendCapabilities,
+    BackendChainEntry,
     BaseFormatOption,
     ConversionStatus,
     DoclingComponentType,
@@ -120,6 +127,14 @@ _PIPELINE_CACHE_LOCK = threading.Lock()
 class FormatOption(BaseFormatOption):
     pipeline_cls: Type[BasePipeline]
     backend_options: Optional[BackendOptions] = None
+    fallback_backends: Optional[list[BackendChainEntry]] = Field(
+        default=None,
+        description=(
+            "Ordered backends tried for one document when the primary backend "
+            "is unavailable for it or fails mid-document. When unset, a single "
+            "backend is used and conversion behavior is unchanged."
+        ),
+    )
 
     def backend_options_for_input(
         self, source: Path | str | DocumentStream
@@ -132,6 +147,32 @@ class FormatOption(BaseFormatOption):
             self.pipeline_options = self.pipeline_cls.get_default_options()
 
         return self
+
+    @model_validator(mode="after")
+    def validate_fallback_chain(self) -> Self:
+        if self.fallback_backends is not None and not self.fallback_backends:
+            raise ValueError(
+                "fallback_backends must contain at least one entry or be left unset."
+            )
+        seen: set[Type[AbstractDocumentBackend]] = {self.backend}
+        for entry in self.fallback_backends or []:
+            if entry.backend in seen:
+                raise ValueError(
+                    f"Duplicate backend {entry.backend.__name__} in the fallback "
+                    "chain: each backend class may appear at most once."
+                )
+            seen.add(entry.backend)
+        return self
+
+    @property
+    def backend_chain(self) -> list[BackendChainEntry]:
+        """The ordered chain: the primary backend followed by the fallbacks."""
+        primary = BackendChainEntry(
+            backend=self.backend,
+            backend_options=self.backend_options,
+            capabilities=BackendCapabilities.from_backend_class(self.backend),
+        )
+        return [primary, *(self.fallback_backends or [])]
 
 
 class BoxNoteFormatOption(FormatOption):
@@ -513,6 +554,13 @@ class DocumentConverter:
             )
             for format in self.allowed_formats
         }
+        # Reject invalid fallback chains (unknown/duplicate backends, format or
+        # pipeline incompatibility, capability mismatches) before any document
+        # is processed. A format option without a declared chain is trusted, as
+        # before this feature existed.
+        for format, fopt in self.format_to_options.items():
+            if fopt.fallback_backends:
+                validate_backend_chain(format, fopt.backend_chain, fopt.pipeline_cls)
         self.initialized_pipelines: dict[
             tuple[Type[BasePipeline], str], BasePipeline
         ] = {}
@@ -863,6 +911,54 @@ class DocumentConverter:
         if backend is not None:
             backend.unload()
 
+    def _record_backend_attempts(
+        self, in_doc: InputDocument, conv_res: ConversionResult
+    ) -> ConversionResult:
+        """Attach the backend fallback trace and per-link failure errors.
+
+        Successful and partial conversions only gain the structured
+        ``backend_attempts`` trace (no extra error entries). On a total
+        failure, every excluded chain link additionally gets its own
+        ``DOCUMENT_BACKEND`` error item, while the original failure entry stays
+        in place.
+        """
+        backend = getattr(in_doc, "_backend", None)
+        attempts = get_backend_attempts(backend) if backend is not None else None
+        if not attempts:
+            return conv_res
+        conv_res.backend_attempts = attempts
+
+        if conv_res.status != ConversionStatus.FAILURE:
+            return conv_res
+
+        existing_messages = {item.error_message for item in conv_res.errors}
+        for attempt in attempts:
+            if (
+                attempt.status == BackendAttemptStatus.SELECTED
+                or attempt.reason is None
+            ):
+                continue
+            reason_detail = (
+                f"{attempt.reason.value}: {attempt.detail}"
+                if attempt.detail
+                else attempt.reason.value
+            )
+            message = (
+                f"Backend {attempt.backend} excluded from the fallback chain "
+                f"({reason_detail})."
+            )
+            if message in existing_messages:
+                continue
+            conv_res.errors.append(
+                ErrorItem(
+                    component_type=DoclingComponentType.DOCUMENT_BACKEND,
+                    module_name=attempt.backend,
+                    error_message=message,
+                    category=FailureCategory.BACKEND_FAILURE,
+                )
+            )
+        return conv_res
+
     def _execute_pipeline(
         self, in_doc: InputDocument, raises_on_error: bool
     ) -> ConversionResult:
@@ -900,4 +996,4 @@ class DocumentConverter:
             finally:
                 self._unload_input_document(in_doc)
 
-        return conv_res
+        return self._record_backend_attempts(in_doc, conv_res)

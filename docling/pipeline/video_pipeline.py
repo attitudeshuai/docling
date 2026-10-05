@@ -125,6 +125,10 @@ class VideoPipeline(BasePipeline):
     def is_backend_supported(cls, backend: AbstractDocumentBackend) -> bool:
         return isinstance(backend, NoOpBackend)
 
+    @classmethod
+    def supports_backend_class(cls, backend_cls: type[AbstractDocumentBackend]) -> bool:
+        return issubclass(backend_cls, NoOpBackend)
+
     def _determine_status(self, conv_res: ConversionResult) -> ConversionStatus:
         if conv_res.status == ConversionStatus.FAILURE:
             return ConversionStatus.FAILURE

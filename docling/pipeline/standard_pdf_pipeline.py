@@ -1193,6 +1193,10 @@ class StandardPdfPipeline(ConvertPipeline):
     def is_backend_supported(cls, backend: AbstractDocumentBackend) -> bool:
         return isinstance(backend, PdfDocumentBackend)
 
+    @classmethod
+    def supports_backend_class(cls, backend_cls: type[AbstractDocumentBackend]) -> bool:
+        return issubclass(backend_cls, PdfDocumentBackend)
+
     def _determine_status(self, conv_res: ConversionResult) -> ConversionStatus:
         return conv_res.status
 
