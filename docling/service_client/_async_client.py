@@ -69,6 +69,7 @@ from docling.datamodel.service.targets import (
 from docling.datamodel.settings import DocumentLimits, PageRange
 from docling.service_client._scheduler import _run_bounded
 from docling.service_client.client import (
+    _STORAGE_TARGET_KINDS,
     DEFAULT_MAX_CONCURRENCY,
     BatchSubmitTarget,
     ChunkerKind,
@@ -78,8 +79,11 @@ from docling.service_client.client import (
     StatusWatcherKind,
     SubmitTarget,
     _BaseDoclingServiceClient,
+    _convert_details,
+    _descriptor_from_record,
     _is_storage_target,
     _ResolvedOptions,
+    _sanitize_model,
     _SourceDescriptor,
 )
 from docling.service_client.exceptions import (
@@ -95,6 +99,13 @@ from docling.service_client.exceptions import (
     UsageLimitExceededError,
 )
 from docling.service_client.job import AsyncConversionJob, _AsyncJobHandlers
+from docling.service_client.ledger import (
+    JobLedgerConfig,
+    _Existing,
+    _LedgerRecord,
+    _PeerWait,
+    _TargetMarker,
+)
 from docling.service_client.watchers import (
     AsyncPollingWatcher,
     AsyncWebSocketWatcher,
@@ -123,6 +134,7 @@ class AsyncDoclingServiceClient(_BaseDoclingServiceClient):
         http_retries: int = 3,
         http_connect_timeout: float = 10.0,
         http_read_timeout: float = 60.0,
+        ledger: JobLedgerConfig | str | Path | None = None,
     ) -> None:
         super().__init__(
             url=url,
@@ -137,6 +149,7 @@ class AsyncDoclingServiceClient(_BaseDoclingServiceClient):
             http_retries=http_retries,
             http_connect_timeout=http_connect_timeout,
             http_read_timeout=http_read_timeout,
+            ledger=ledger,
         )
         self._async_client: httpx.AsyncClient | None = None
         self._polling_watcher: AsyncPollingWatcher | None = None
@@ -238,70 +251,116 @@ class AsyncDoclingServiceClient(_BaseDoclingServiceClient):
             max_file_size=None,
             page_range=None,
         )
+        # Effective options/target are computed before the possible ledger
+        # lookup so the fingerprint always reflects what is actually submitted.
+        provisional_target = PresignedUrlTarget() if target is None else target
+        submit_options = self._options_for_output_formats(
+            resolved.options,
+            output_formats=output_formats,
+            target=provisional_target,
+        )
 
-        effective_target: SubmitTarget
         if target is None:
-            effective_target = PresignedUrlTarget()
-            submit_options = self._options_for_output_formats(
-                resolved.options,
-                output_formats=output_formats,
-                target=effective_target,
-            )
-            try:
-                initial_status = await self._submit_convert_task(
-                    source=source,
-                    options=submit_options,
-                    target=effective_target,
-                    async_client=self._async_client,
-                    request_headers=headers,
-                )
-            except ServiceError as exc:
-                if not self._should_fallback_from_presigned_target(exc):
-                    raise
-                effective_target = InBodyTarget()
-                submit_options = self._options_for_output_formats(
+            fingerprint_payload = {
+                "jk": "convert",
+                "src": self._source_fingerprint(source),
+                "opt": submit_options.model_dump(mode="json"),
+                "tgt": ("auto",),
+                "mat": False,
+                "hdr": self._headers_fingerprint(headers),
+            }
+            actual_target_kind: dict[str, str] = {}
+
+            async def do_submit() -> TaskStatusResponse:
+                try:
+                    status = await self._submit_convert_task(
+                        source=source,
+                        options=submit_options,
+                        target=PresignedUrlTarget(),
+                        async_client=self._async_client,
+                        request_headers=headers,
+                    )
+                    actual_target_kind["tk"] = "presigned_url"
+                    return status
+                except ServiceError as exc:
+                    if not self._should_fallback_from_presigned_target(exc):
+                        raise
+                inbody = InBodyTarget()
+                fallback_options = self._options_for_output_formats(
                     resolved.options,
                     output_formats=output_formats,
-                    target=effective_target,
+                    target=inbody,
                 )
-                initial_status = await self._submit_convert_task(
+                status = await self._submit_convert_task(
                     source=source,
-                    options=submit_options,
-                    target=effective_target,
+                    options=fallback_options,
+                    target=inbody,
                     async_client=self._async_client,
                     request_headers=headers,
                 )
-        else:
-            effective_target = target
-            submit_options = self._options_for_output_formats(
-                resolved.options,
-                output_formats=output_formats,
-                target=effective_target,
-            )
-            initial_status = await self._submit_convert_task(
-                source=source,
-                options=submit_options,
-                target=effective_target,
-                async_client=self._async_client,
-                request_headers=headers,
-            )
+                actual_target_kind["tk"] = "inbody"
+                return status
 
-        handlers: _AsyncJobHandlers[Any] = _AsyncJobHandlers(
-            poll=self._poll_task_status,
-            watch=lambda tid, t: self._status_watcher().iter_updates(tid, t),
-            wait=lambda tid, t: self._status_watcher().wait_for_terminal(tid, t),
-            fetch_result=self._make_convert_fetch_result_handler(
+            def details_factory(initial: TaskStatusResponse) -> dict[str, Any]:
+                return _convert_details(
+                    descriptor=descriptor,
+                    target_kind=actual_target_kind["tk"],
+                    materialize=False,
+                )
+        else:
+            fingerprint_payload = {
+                "jk": "convert",
+                "src": self._source_fingerprint(source),
+                "opt": submit_options.model_dump(mode="json"),
+                "tgt": ("explicit", _sanitize_model(target)),
+                "mat": False,
+                "hdr": self._headers_fingerprint(headers),
+            }
+
+            async def do_submit() -> TaskStatusResponse:
+                assert target is not None
+                return await self._submit_convert_task(
+                    source=source,
+                    options=submit_options,
+                    target=target,
+                    async_client=self._async_client,
+                    request_headers=headers,
+                )
+
+            def details_factory(initial: TaskStatusResponse) -> dict[str, Any]:
+                assert target is not None
+                return _convert_details(
+                    descriptor=descriptor,
+                    target_kind=target.kind,
+                    materialize=False,
+                )
+
+        if self._ledger is None:
+            initial_status = await do_submit()
+            # do_submit records the effective target kind for the auto path;
+            # kind-based handler selection needs no credentials, so a marker is enough.
+            effective_target = (
+                _TargetMarker(actual_target_kind["tk"]) if target is None else target
+            )
+            return await self._assemble_conversion_job(
+                initial_status=initial_status,
                 descriptor=descriptor,
                 limits=resolved.limits,
                 target=effective_target,
-                async_client=self._async_client,
-            ),
+            )
+
+        fingerprint = self._fingerprint(fingerprint_payload)
+        initial_status, record = await self._orchestrate_task(
+            fingerprint=fingerprint,
+            do_submit=do_submit,
+            details_factory=details_factory,
         )
-        return AsyncConversionJob(
-            task_id=initial_status.task_id,
-            submitted_at=datetime.now(tz=timezone.utc),
-            handlers=handlers,
+        return await self._assemble_after_orchestration(
+            fingerprint=fingerprint,
             initial_status=initial_status,
+            record=record,
+            fresh_descriptor=descriptor,
+            limits=resolved.limits,
         )
 
     async def submit_batch(
@@ -343,21 +402,51 @@ class AsyncDoclingServiceClient(_BaseDoclingServiceClient):
             output_formats=output_formats,
             target=first_target,
         )
-        initial_status = await self._submit_batch_task(
-            sources=request.sources,
-            options=submit_options,
-            target=request.target,
-            targets=request.targets,
-            async_client=self._async_client,
-            request_headers=headers,
-        )
-
         all_targets = (
             request.targets
             if request.targets is not None
             else ([request.target] if request.target is not None else [])
         )
-        if any(_is_storage_target(t) for t in all_targets):
+        storage_like = any(_is_storage_target(t) for t in all_targets)
+        fingerprint: str | None = None
+        if self._ledger is not None:
+            fingerprint = self._fingerprint(
+                {
+                    "jk": "batch",
+                    "src": [_sanitize_model(source) for source in request.sources],
+                    "tgt": [_sanitize_model(t) for t in all_targets],
+                    "opt": submit_options.model_dump(mode="json"),
+                    "hdr": self._headers_fingerprint(headers),
+                }
+            )
+            initial_status, record = await self._orchestrate_task(
+                fingerprint=fingerprint,
+                do_submit=lambda: self._submit_batch_task(
+                    sources=request.sources,
+                    options=submit_options,
+                    target=request.target,
+                    targets=request.targets,
+                    async_client=self._async_client,
+                    request_headers=headers,
+                ),
+                details_factory=lambda initial: {
+                    "jk": "batch",
+                    "storage": storage_like,
+                },
+            )
+            if record is not None:
+                storage_like = bool(record.details.get("storage", False))
+        else:
+            initial_status = await self._submit_batch_task(
+                sources=request.sources,
+                options=submit_options,
+                target=request.target,
+                targets=request.targets,
+                async_client=self._async_client,
+                request_headers=headers,
+            )
+
+        if storage_like:
 
             async def fetch_result(
                 task_id: str,
@@ -387,6 +476,8 @@ class AsyncDoclingServiceClient(_BaseDoclingServiceClient):
             wait=lambda tid, t: self._status_watcher().wait_for_terminal(tid, t),
             fetch_result=fetch_result,
         )
+        if fingerprint is not None and self._ledger is not None:
+            handlers = await self._ledered_handlers(fingerprint, handlers)
         return AsyncConversionJob(
             task_id=initial_status.task_id,
             submitted_at=datetime.now(tz=timezone.utc),
@@ -406,11 +497,36 @@ class AsyncDoclingServiceClient(_BaseDoclingServiceClient):
             max_file_size=None,
             page_range=None,
         )
-        initial_status = await self._submit_chunk_task(
-            source=source,
-            chunker=chunker,
-            options=resolved.options,
-        )
+        fingerprint: str | None = None
+        if self._ledger is not None:
+            fingerprint = self._fingerprint(
+                {
+                    "jk": "chunk",
+                    "ch": chunker.value,
+                    "src": self._source_fingerprint(source),
+                    "opt": resolved.options.model_dump(mode="json"),
+                    "tgt": ("inbody",),
+                    "hdr": self._headers_fingerprint(None),
+                }
+            )
+            initial_status, _record = await self._orchestrate_task(
+                fingerprint=fingerprint,
+                do_submit=lambda: self._submit_chunk_task(
+                    source=source,
+                    chunker=chunker,
+                    options=resolved.options,
+                ),
+                details_factory=lambda initial: {
+                    "jk": "chunk",
+                    "ch": chunker.value,
+                },
+            )
+        else:
+            initial_status = await self._submit_chunk_task(
+                source=source,
+                chunker=chunker,
+                options=resolved.options,
+            )
         handlers: _AsyncJobHandlers[ChunkDocumentResponse] = _AsyncJobHandlers(
             poll=self._poll_task_status,
             watch=lambda tid, t: self._status_watcher().iter_updates(tid, t),
@@ -420,6 +536,8 @@ class AsyncDoclingServiceClient(_BaseDoclingServiceClient):
                 last_status=last,
             ),
         )
+        if fingerprint is not None and self._ledger is not None:
+            handlers = await self._ledered_handlers(fingerprint, handlers)
         return AsyncConversionJob(
             task_id=initial_status.task_id,
             submitted_at=datetime.now(tz=timezone.utc),
@@ -473,43 +591,105 @@ class AsyncDoclingServiceClient(_BaseDoclingServiceClient):
                 output_formats=None,
                 target=effective_target,
             )
-            try:
-                initial_status = await self._submit_convert_task(
-                    source=item.source,
-                    options=submit_options,
-                    target=effective_target,
-                    async_client=async_client,
-                    request_headers=item.headers,
-                )
-            except ServiceError as exc:
-                if (
-                    target is not None
-                    or not self._should_fallback_from_presigned_target(exc)
-                ):
-                    raise
-                effective_target = InBodyTarget()
+            actual_target_kind: dict[str, str] = {}
+
+            async def do_submit() -> TaskStatusResponse:
+                nonlocal submit_options
+                try:
+                    status = await self._submit_convert_task(
+                        source=item.source,
+                        options=submit_options,
+                        target=effective_target,
+                        async_client=async_client,
+                        request_headers=item.headers,
+                    )
+                    actual_target_kind["tk"] = effective_target.kind
+                    return status
+                except ServiceError as exc:
+                    if (
+                        target is not None
+                        or not self._should_fallback_from_presigned_target(exc)
+                    ):
+                        raise
+                fallback_target = InBodyTarget()
                 submit_options = self._options_for_output_formats(
                     resolved.options,
                     output_formats=None,
-                    target=effective_target,
+                    target=fallback_target,
                 )
-                initial_status = await self._submit_convert_task(
+                status = await self._submit_convert_task(
                     source=item.source,
                     options=submit_options,
-                    target=effective_target,
+                    target=fallback_target,
                     async_client=async_client,
                     request_headers=item.headers,
                 )
+                actual_target_kind["tk"] = fallback_target.kind
+                return status
 
-            terminal_status = (
-                await self._wait_for_terminal_status_for_submit_and_retrieve_many(
-                    task_id=initial_status.task_id,
-                    timeout=self._job_timeout,
-                    async_client=async_client,
-                    max_in_flight=max_in_flight,
+            def details_factory(initial: TaskStatusResponse) -> dict[str, Any]:
+                descriptor = self._describe_source(item.source)
+                return _convert_details(
+                    descriptor=descriptor,
+                    target_kind=actual_target_kind["tk"],
+                    materialize=False,
                 )
-            )
-            if isinstance(effective_target, PresignedUrlTarget):
+
+            fingerprint: str | None = None
+            if self._ledger is not None:
+                target_spec = (
+                    ("auto",)
+                    if target is None
+                    else ("explicit", _sanitize_model(target))
+                )
+                fingerprint = self._fingerprint(
+                    {
+                        "jk": "convert",
+                        "src": self._source_fingerprint(item.source),
+                        "opt": submit_options.model_dump(mode="json"),
+                        "tgt": target_spec,
+                        "mat": False,
+                        "hdr": self._headers_fingerprint(item.headers),
+                    }
+                )
+                initial_status, record = await self._orchestrate_task(
+                    fingerprint=fingerprint,
+                    do_submit=do_submit,
+                    details_factory=details_factory,
+                )
+                if record is None:
+                    result_kind = actual_target_kind["tk"]
+                else:
+                    result_kind = record.details.get(
+                        "tk", actual_target_kind.get("tk", "inbody")
+                    )
+            else:
+                initial_status = await do_submit()
+                result_kind = actual_target_kind["tk"]
+
+            # Skip the wait when the reattachment probe already shows terminal.
+            if not is_terminal_task_status(initial_status):
+                terminal_status = (
+                    await self._wait_for_terminal_status_for_submit_and_retrieve_many(
+                        task_id=initial_status.task_id,
+                        timeout=self._job_timeout,
+                        async_client=async_client,
+                        max_in_flight=max_in_flight,
+                    )
+                )
+            else:
+                terminal_status = initial_status
+
+            # This path bypasses job handlers; persist terminal status explicitly.
+            if fingerprint is not None and self._ledger is not None:
+                await asyncio.to_thread(
+                    self._ledger.note_status,
+                    fingerprint,
+                    initial_status.task_id,
+                    terminal_status.task_status,
+                )
+
+            if result_kind == "presigned_url":
                 return await self._fetch_presigned_result(
                     task_id=initial_status.task_id,
                     last_status=terminal_status,
@@ -615,22 +795,23 @@ class AsyncDoclingServiceClient(_BaseDoclingServiceClient):
         self,
         descriptor: _SourceDescriptor,
         limits: DocumentLimits,
-        target: SubmitTarget,
+        target: SubmitTarget | _TargetMarker,
         async_client: httpx.AsyncClient,
     ) -> Any:
-        if isinstance(target, ZipTarget):
+        kind = target.kind
+        if kind == "zip":
             return lambda task_id, last_status: self._fetch_raw_result(
                 task_id=task_id,
                 last_status=last_status,
                 async_client=async_client,
             )
-        if isinstance(target, PresignedUrlTarget):
+        if kind == "presigned_url":
             return lambda task_id, last_status: self._fetch_presigned_result(
                 task_id=task_id,
                 last_status=last_status,
                 async_client=async_client,
             )
-        if _is_storage_target(target):
+        if kind in _STORAGE_TARGET_KINDS:
             return lambda task_id, last_status: self._fetch_presigned_document_result(
                 task_id=task_id,
                 last_status=last_status,
@@ -643,6 +824,181 @@ class AsyncDoclingServiceClient(_BaseDoclingServiceClient):
             last_status=last_status,
             async_client=async_client,
         )
+
+    # ------------------------------------------------------------------
+    # Ledger orchestration
+    # ------------------------------------------------------------------
+
+    async def _assemble_conversion_job(
+        self,
+        *,
+        initial_status: TaskStatusResponse,
+        descriptor: _SourceDescriptor,
+        limits: DocumentLimits,
+        target: SubmitTarget | _TargetMarker,
+        fingerprint: str | None = None,
+    ) -> AsyncConversionJob[Any]:
+        assert self._async_client is not None
+        fetch_result = self._make_convert_fetch_result_handler(
+            descriptor=descriptor,
+            limits=limits,
+            target=target,
+            async_client=self._async_client,
+        )
+        handlers: _AsyncJobHandlers[Any] = _AsyncJobHandlers(
+            poll=self._poll_task_status,
+            watch=lambda tid, t: self._status_watcher().iter_updates(tid, t),
+            wait=lambda tid, t: self._status_watcher().wait_for_terminal(tid, t),
+            fetch_result=fetch_result,
+        )
+        if fingerprint is not None and self._ledger is not None:
+            handlers = await self._ledered_handlers(fingerprint, handlers)
+        return AsyncConversionJob(
+            task_id=initial_status.task_id,
+            submitted_at=datetime.now(tz=timezone.utc),
+            handlers=handlers,
+            initial_status=initial_status,
+        )
+
+    async def _assemble_after_orchestration(
+        self,
+        *,
+        fingerprint: str,
+        initial_status: TaskStatusResponse,
+        record: _LedgerRecord | None,
+        fresh_descriptor: _SourceDescriptor,
+        limits: DocumentLimits,
+    ) -> AsyncConversionJob[Any]:
+        assert self._ledger is not None
+        stored = await asyncio.to_thread(self._ledger.get_record, fingerprint)
+        assert stored is not None
+        descriptor = (
+            fresh_descriptor if record is None else _descriptor_from_record(stored)
+        )
+        return await self._assemble_conversion_job(
+            initial_status=initial_status,
+            descriptor=descriptor,
+            limits=limits,
+            target=_TargetMarker(stored.details["tk"]),
+            fingerprint=fingerprint,
+        )
+
+    async def _orchestrate_task(
+        self,
+        *,
+        fingerprint: str,
+        do_submit: Any,
+        details_factory: Any,
+    ) -> tuple[TaskStatusResponse, _LedgerRecord | None]:
+        """Async counterpart of the sync intent → submit → complete flow."""
+        ledger = self._ledger
+        assert ledger is not None
+        await asyncio.to_thread(ledger.auto_purge_once)
+        decision = await asyncio.to_thread(ledger.begin, fingerprint)
+        while isinstance(decision, _PeerWait):
+            await asyncio.sleep(ledger.peer_poll_interval)
+            decision = await asyncio.to_thread(ledger.begin, fingerprint)
+        if isinstance(decision, _Existing):
+            record = decision.record
+            if record.state == "orphaned":
+                raise TaskNotFoundError(
+                    f"Task {record.task_id} recorded in the local job ledger is "
+                    "no longer known to the service and cannot be resumed."
+                )
+            return await self._probe_ledged_task(record), record
+
+        token = decision.token
+        try:
+            initial_status = await do_submit()
+        except BaseException:
+            await asyncio.to_thread(ledger.abandon, fingerprint, token)
+            raise
+        completed = await asyncio.to_thread(
+            ledger.complete,
+            fingerprint,
+            token,
+            initial_status.task_id,
+            initial_status.task_status,
+            details_factory(initial_status),
+        )
+        if completed is None:
+            peer = await asyncio.to_thread(ledger.get_record, fingerprint)
+            assert peer is not None
+            return await self._probe_ledged_task(peer), peer
+        return initial_status, None
+
+    async def _probe_ledged_task(self, record: _LedgerRecord) -> TaskStatusResponse:
+        assert record.task_id is not None
+        try:
+            return await self._poll_task_status(record.task_id, 0.0)
+        except TaskNotFoundError:
+            assert self._ledger is not None
+            await asyncio.to_thread(
+                self._ledger.mark_orphaned,
+                record.fingerprint,
+                record.task_id,
+            )
+            raise TaskNotFoundError(
+                f"Task {record.task_id} recorded in the local job ledger is "
+                "no longer known to the service and cannot be resumed."
+            )
+
+    async def _ledered_handlers(
+        self,
+        fingerprint: str,
+        handlers: _AsyncJobHandlers[Any],
+    ) -> _AsyncJobHandlers[Any]:
+        """Wrap async job handlers so status changes persist into the ledger."""
+        ledger = self._ledger
+        assert ledger is not None
+
+        async def poll(task_id: str, wait: float) -> TaskStatusResponse:
+            status = await handlers.poll(task_id, wait)
+            await asyncio.to_thread(
+                ledger.note_status, fingerprint, task_id, status.task_status
+            )
+            return status
+
+        async def watch_iter(
+            task_id: str, timeout: float | None
+        ) -> AsyncIterator[TaskStatusResponse]:
+            async for status in handlers.watch(task_id, timeout):
+                await asyncio.to_thread(
+                    ledger.note_status,
+                    fingerprint,
+                    task_id,
+                    status.task_status,
+                )
+                yield status
+
+        async def wait(task_id: str, timeout: float | None) -> TaskStatusResponse:
+            status = await handlers.wait(task_id, timeout)
+            await asyncio.to_thread(
+                ledger.note_status, fingerprint, task_id, status.task_status
+            )
+            return status
+
+        async def fetch_result(
+            task_id: str, last_status: TaskStatusResponse | None
+        ) -> Any:
+            try:
+                return await handlers.fetch_result(task_id, last_status)
+            except TaskNotFoundError:
+                await asyncio.to_thread(ledger.mark_orphaned, fingerprint, task_id)
+                raise
+
+        return _AsyncJobHandlers[Any](
+            poll=poll,
+            watch=watch_iter,
+            wait=wait,
+            fetch_result=fetch_result,
+        )
+
+    async def purge_expired_records(self) -> int:
+        """Remove records past the configured TTL; no-op without a ledger."""
+        if self._ledger is None:
+            return 0
+        return await asyncio.to_thread(self._ledger.purge_expired)
 
     async def _request_with_retry(
         self,

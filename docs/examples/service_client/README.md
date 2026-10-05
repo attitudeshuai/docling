@@ -52,6 +52,42 @@ for result in client.convert_all(
 Defaults (OCR, table structure, Markdown output) match that of docling's `DocumentConverter`. Pass
 `options=ConvertDocumentsOptions(...)` only when you need to override them.
 
+## Resuming after a restart — the local job ledger
+
+The remote service returns a task id, while the actual job handle only lives in
+the process that submitted it. If that process exits or crashes, callers cannot
+tell which tasks were already submitted and typically resubmit everything —
+spending extra quota and potentially producing duplicate results.
+
+Opt into a local **job ledger** to make `submit` / wait / result retrieval
+resumable across restarts:
+
+```python
+from docling.service_client import DoclingServiceClient, JobLedgerConfig
+
+client = DoclingServiceClient(
+    url=...,
+    api_key=...,
+    ledger=JobLedgerConfig(path="./docling-jobs.jsonl"),
+)
+```
+
+With a ledger configured:
+
+- an intent record is written **before** each submission and completed with the
+  server-assigned task id once the submission returns;
+- the same source with the same settings is submitted only **once** — later
+  calls (also from other processes sharing the ledger) reattach to the existing
+  task; completed tasks return their result directly, running tasks keep waiting;
+- if the service no longer recognizes a recorded task, a
+  `TaskNotFoundError` is raised instead of waiting forever;
+- corrupt or half-written records are skipped individually, records past the
+  TTL are cleaned up (`purge_expired_records()`), and no credentials (API keys,
+  request headers, storage secrets) are ever written to the ledger.
+
+The ledger is **off by default**; without it the client behaves exactly as
+before. Tune takeover timeout, record TTL and cleanup via `JobLedgerConfig`.
+
 ## Examples
 
 

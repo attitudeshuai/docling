@@ -42,6 +42,7 @@ from docling.service_client.exceptions import (
     UsageLimitExceededError,
 )
 from docling.service_client.job import AsyncConversionJob, ConversionJob
+from docling.service_client.ledger import JobLedgerConfig
 
 __all__ = [
     "DEFAULT_MAX_CONCURRENCY",
@@ -61,6 +62,7 @@ __all__ = [
     "DoclingServiceClientError",
     "GenericSourceRequest",
     "GenericTargetRequest",
+    "JobLedgerConfig",
     "PresignedUrlConvertDocumentResponse",
     "PresignedUrlConvertResponse",
     "PresignedUrlTarget",

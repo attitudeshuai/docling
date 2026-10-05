@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
@@ -99,6 +100,14 @@ from docling.service_client.exceptions import (
     UsageLimitExceededError,
 )
 from docling.service_client.job import ConversionJob, _JobHandlers
+from docling.service_client.ledger import (
+    JobLedgerConfig,
+    _Existing,
+    _JobLedger,
+    _LedgerRecord,
+    _PeerWait,
+    _TargetMarker,
+)
 from docling.service_client.watchers import (
     PollingWatcher,
     StatusWatcher,
@@ -141,9 +150,77 @@ _STORAGE_TARGET_TYPES = (
     GenericTargetRequest,
 )
 
+# Target kinds whose results are presigned URL documents for external storage.
+_STORAGE_TARGET_KINDS: frozenset[str] = frozenset(
+    {"s3", "azure_blob", "google_cloud_storage", "google_drive"}
+)
+# Credential fields stored as *plain strings* (Pydantic does not mask these in
+# JSON mode, unlike SecretStr). They must never reach the ledger.
+_PLAINTEXT_SECRET_KEYS: dict[str, frozenset[str]] = {
+    "s3": frozenset({"access_key", "secret_key"}),
+    "azure_blob": frozenset({"connection_string"}),
+    "google_drive": frozenset({"refresh_token"}),
+}
+
 
 def _is_storage_target(target: object) -> bool:
     return isinstance(target, _STORAGE_TARGET_TYPES)
+
+
+def _canonical_json(value: Any) -> str:
+    """Deterministic JSON encoding for fingerprint inputs."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _sanitize_model(model: Any) -> dict[str, Any]:
+    """Dump a request/target model without any credential material.
+
+    ``mode="json"`` masks ``SecretStr``/``SecretBytes`` fields; the known
+    plaintext secret fields and HTTP source headers are removed explicitly.
+    """
+    dumped = model.model_dump(mode="json")
+    if isinstance(dumped, dict):
+        kind = dumped.get("kind")
+        if isinstance(kind, str):
+            for key in _PLAINTEXT_SECRET_KEYS.get(kind, frozenset()):
+                dumped.pop(key, None)
+            if kind == "http":
+                dumped.pop("headers", None)
+    return dumped
+
+
+def _convert_details(
+    *,
+    descriptor: _SourceDescriptor,
+    target_kind: str,
+    materialize: bool,
+) -> dict[str, Any]:
+    """Reattachment hints for a conversion record; no credentials."""
+    return {
+        "jk": "convert",
+        "src": descriptor.source_name,
+        "fmt": descriptor.input_format.value,
+        "size": descriptor.file_size,
+        "tk": target_kind,
+        "mat": materialize,
+    }
+
+
+def _descriptor_from_record(
+    record: _LedgerRecord,
+) -> _SourceDescriptor:
+    details = record.details
+    return _SourceDescriptor(
+        source_name=details.get("src", record.task_id or "unknown-document"),
+        input_format=InputFormat(details.get("fmt", "pdf")),
+        file_size=details.get("size"),
+    )
 
 
 def _is_safe_artifact_url(url: str) -> bool:
@@ -250,6 +327,7 @@ class _BaseDoclingServiceClient:
         http_retries: int = 3,
         http_connect_timeout: float = 10.0,
         http_read_timeout: float = 60.0,
+        ledger: JobLedgerConfig | str | Path | None = None,
     ) -> None:
         self._base_url = self._normalize_base_url(url)
         self._api_key = api_key
@@ -272,6 +350,56 @@ class _BaseDoclingServiceClient:
         self._http_retries = http_retries
         self._http_connect_timeout = http_connect_timeout
         self._http_read_timeout = http_read_timeout
+        self._ledger_config = self._normalize_ledger_config(ledger)
+        self._ledger: _JobLedger | None = (
+            _JobLedger(self._ledger_config) if self._ledger_config is not None else None
+        )
+
+    @staticmethod
+    def _normalize_ledger_config(
+        value: JobLedgerConfig | str | Path | None,
+    ) -> JobLedgerConfig | None:
+        if value is None or isinstance(value, JobLedgerConfig):
+            return value
+        if isinstance(value, (str, Path)):
+            return JobLedgerConfig(path=Path(value))
+        raise TypeError("ledger must be a JobLedgerConfig, path-like value, or None.")
+
+    def _fingerprint(self, payload: dict[str, Any]) -> str:
+        return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+    def _headers_fingerprint(self, headers: dict[str, str] | None) -> str:
+        return hashlib.sha256(
+            _canonical_json(headers or {}).encode("utf-8")
+        ).hexdigest()
+
+    def _source_fingerprint(self, source: SourceType) -> dict[str, Any]:
+        """Describe a source for fingerprinting without storing credentials."""
+        normalized = self._normalize_source(source)
+        if isinstance(normalized, Path):
+            stat = normalized.stat()
+            return {
+                "k": "file",
+                "p": str(normalized.resolve()),
+                "s": stat.st_size,
+                "m": stat.st_mtime_ns,
+            }
+        if isinstance(normalized, DocumentStream):
+            data = normalized.stream.getbuffer()
+            return {
+                "k": "stream",
+                "n": normalized.name,
+                "s": len(data),
+                "h": hashlib.sha256(data).hexdigest(),
+            }
+        return {
+            "k": "http",
+            "u": str(normalized.url),
+            # Source headers may carry auth: hash them for identity, never store.
+            "h": hashlib.sha256(
+                _canonical_json(normalized.headers).encode("utf-8")
+            ).hexdigest(),
+        }
 
     def _parse_result_model_response(
         self,
@@ -822,6 +950,7 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
         http_retries: int = 3,
         http_connect_timeout: float = 10.0,
         http_read_timeout: float = 60.0,
+        ledger: JobLedgerConfig | str | Path | None = None,
         artifact_download_timeout: float = DEFAULT_ARTIFACT_DOWNLOAD_TIMEOUT_SECONDS,
         max_artifact_download_bytes: int = DEFAULT_MAX_ARTIFACT_DOWNLOAD_BYTES,
         # Internal: skip the artifact SSRF guard for private/loopback storage.
@@ -840,6 +969,7 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
             http_retries=http_retries,
             http_connect_timeout=http_connect_timeout,
             http_read_timeout=http_read_timeout,
+            ledger=ledger,
         )
         self._artifact_download_timeout = artifact_download_timeout
         self._max_artifact_download_bytes = max_artifact_download_bytes
@@ -1060,6 +1190,38 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
                 limits=resolved.limits,
                 request_headers=headers,
             )
+        if self._ledger is not None:
+            fingerprint = self._fingerprint(
+                {
+                    "jk": "convert",
+                    "src": self._source_fingerprint(source),
+                    "opt": submit_options.model_dump(mode="json"),
+                    "tgt": ("explicit", _sanitize_model(target)),
+                    "mat": False,
+                    "hdr": self._headers_fingerprint(headers),
+                }
+            )
+            initial_status, record = self._orchestrate_task(
+                fingerprint=fingerprint,
+                do_submit=lambda: self._submit_convert_task(
+                    source=source,
+                    options=submit_options,
+                    target=target,
+                    request_headers=headers,
+                ),
+                details_factory=lambda initial: _convert_details(
+                    descriptor=descriptor,
+                    target_kind=target.kind,
+                    materialize=False,
+                ),
+            )
+            return self._assemble_after_orchestration(
+                fingerprint=fingerprint,
+                initial_status=initial_status,
+                record=record,
+                fresh_descriptor=descriptor,
+                limits=resolved.limits,
+            )
         return self._submit_conversion_job(
             source=source,
             options=submit_options,
@@ -1126,11 +1288,36 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
             max_file_size=None,
             page_range=None,
         )
-        initial_status = self._submit_chunk_task(
-            source=source,
-            chunker=chunker,
-            options=resolved.options,
-        )
+        fingerprint: str | None = None
+        if self._ledger is not None:
+            fingerprint = self._fingerprint(
+                {
+                    "jk": "chunk",
+                    "ch": chunker.value,
+                    "src": self._source_fingerprint(source),
+                    "opt": resolved.options.model_dump(mode="json"),
+                    "tgt": ("inbody",),
+                    "hdr": self._headers_fingerprint(None),
+                }
+            )
+            initial_status, _record = self._orchestrate_task(
+                fingerprint=fingerprint,
+                do_submit=lambda: self._submit_chunk_task(
+                    source=source,
+                    chunker=chunker,
+                    options=resolved.options,
+                ),
+                details_factory=lambda initial: {
+                    "jk": "chunk",
+                    "ch": chunker.value,
+                },
+            )
+        else:
+            initial_status = self._submit_chunk_task(
+                source=source,
+                chunker=chunker,
+                options=resolved.options,
+            )
         handlers = _JobHandlers[ChunkDocumentResponse](
             poll=self._poll_task_status,
             watch=self._watch_task_updates,
@@ -1140,6 +1327,8 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
                 last_status=last_status,
             ),
         )
+        if fingerprint is not None and self._ledger is not None:
+            handlers = self._ledered_handlers(fingerprint, handlers)
         return ConversionJob(
             task_id=initial_status.task_id,
             submitted_at=datetime.now(tz=timezone.utc),
@@ -1210,24 +1399,187 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
             target=target,
             request_headers=request_headers,
         )
+        return self._assemble_conversion_job(
+            initial_status=initial_status,
+            descriptor=descriptor,
+            limits=limits,
+            target=target,
+            materialize_presigned=materialize_presigned,
+        )
+
+    def _assemble_conversion_job(
+        self,
+        *,
+        initial_status: TaskStatusResponse,
+        descriptor: _SourceDescriptor,
+        limits: DocumentLimits,
+        target: SubmitTarget | _TargetMarker,
+        materialize_presigned: bool = False,
+        fingerprint: str | None = None,
+    ) -> (
+        ConversionJob[ConversionResult]
+        | ConversionJob[RawServiceResult]
+        | ConversionJob[PresignedUrlConvertDocumentResponse]
+        | ConversionJob[PresignedUrlConvertResponse]
+    ):
         fetch_result = self._make_convert_fetch_result_handler(
             descriptor=descriptor,
             limits=limits,
             target=target,
             materialize_presigned=materialize_presigned,
         )
-        handlers = _JobHandlers[Any](
+        handlers: _JobHandlers[Any] = _JobHandlers(
             poll=self._poll_task_status,
             watch=self._watch_task_updates,
             wait=self._wait_for_terminal_status,
             fetch_result=fetch_result,
         )
+        if fingerprint is not None and self._ledger is not None:
+            handlers = self._ledered_handlers(fingerprint, handlers)
         return ConversionJob(
             task_id=initial_status.task_id,
             submitted_at=datetime.now(tz=timezone.utc),
             handlers=handlers,
             initial_status=initial_status,
         )
+
+    # ------------------------------------------------------------------
+    # Ledger orchestration
+    # ------------------------------------------------------------------
+
+    def _assemble_after_orchestration(
+        self,
+        *,
+        fingerprint: str,
+        initial_status: TaskStatusResponse,
+        record: _LedgerRecord | None,
+        fresh_descriptor: _SourceDescriptor,
+        limits: DocumentLimits,
+    ) -> (
+        ConversionJob[ConversionResult]
+        | ConversionJob[RawServiceResult]
+        | ConversionJob[PresignedUrlConvertDocumentResponse]
+        | ConversionJob[PresignedUrlConvertResponse]
+    ):
+        assert self._ledger is not None
+        stored = self._ledger.get_record(fingerprint)
+        assert stored is not None
+        descriptor = (
+            fresh_descriptor if record is None else _descriptor_from_record(stored)
+        )
+        return self._assemble_conversion_job(
+            initial_status=initial_status,
+            descriptor=descriptor,
+            limits=limits,
+            target=_TargetMarker(stored.details["tk"]),
+            materialize_presigned=bool(stored.details.get("mat", False)),
+            fingerprint=fingerprint,
+        )
+
+    def _orchestrate_task(
+        self,
+        *,
+        fingerprint: str,
+        do_submit: Any,
+        details_factory: Any,
+    ) -> tuple[TaskStatusResponse, _LedgerRecord | None]:
+        """Run the intent → submit → complete flow.
+
+        Returns the status to build the job with and the existing record when
+        the submission was resumed (``None`` for a fresh submission).
+        """
+        ledger = self._ledger
+        assert ledger is not None
+        ledger.auto_purge_once()
+        decision = ledger.begin(fingerprint)
+        while isinstance(decision, _PeerWait):
+            # Another process is currently submitting the identical job.
+            time.sleep(ledger.peer_poll_interval)
+            decision = ledger.begin(fingerprint)
+        if isinstance(decision, _Existing):
+            record = decision.record
+            if record.state == "orphaned":
+                raise TaskNotFoundError(
+                    f"Task {record.task_id} recorded in the local job ledger is "
+                    "no longer known to the service and cannot be resumed."
+                )
+            return self._probe_ledged_task(record), record
+
+        token = decision.token
+        try:
+            initial_status = do_submit()
+        except BaseException:
+            ledger.abandon(fingerprint, token)
+            raise
+        completed = ledger.complete(
+            fingerprint,
+            token,
+            task_id=initial_status.task_id,
+            task_status=initial_status.task_status,
+            details=details_factory(initial_status),
+        )
+        if completed is None:
+            # A concurrent stale-intent takeover won; discard our submission
+            # and reattach to the winner's task id.
+            peer = ledger.get_record(fingerprint)
+            assert peer is not None
+            return self._probe_ledged_task(peer), peer
+        return initial_status, None
+
+    def _probe_ledged_task(self, record: _LedgerRecord) -> TaskStatusResponse:
+        """Check a recorded task is still known; mark + raise if it is not."""
+        assert record.task_id is not None
+        try:
+            return self._poll_task_status(record.task_id, 0.0)
+        except TaskNotFoundError:
+            assert self._ledger is not None
+            self._ledger.mark_orphaned(record.fingerprint, record.task_id)
+            raise TaskNotFoundError(
+                f"Task {record.task_id} recorded in the local job ledger is "
+                "no longer known to the service and cannot be resumed."
+            )
+
+    def _ledered_handlers(
+        self, fingerprint: str, handlers: _JobHandlers[Any]
+    ) -> _JobHandlers[Any]:
+        """Wrap job handlers so status changes persist into the ledger."""
+        ledger = self._ledger
+        assert ledger is not None
+
+        def poll(task_id: str, wait: float) -> TaskStatusResponse:
+            status = handlers.poll(task_id, wait)
+            ledger.note_status(fingerprint, task_id, status.task_status)
+            return status
+
+        def watch(task_id: str, timeout: float | None) -> Iterator[TaskStatusResponse]:
+            for status in handlers.watch(task_id, timeout):
+                ledger.note_status(fingerprint, task_id, status.task_status)
+                yield status
+
+        def wait(task_id: str, timeout: float | None) -> TaskStatusResponse:
+            status = handlers.wait(task_id, timeout)
+            ledger.note_status(fingerprint, task_id, status.task_status)
+            return status
+
+        def fetch_result(task_id: str, last_status: TaskStatusResponse | None) -> Any:
+            try:
+                return handlers.fetch_result(task_id, last_status)
+            except TaskNotFoundError:
+                ledger.mark_orphaned(fingerprint, task_id)
+                raise
+
+        return _JobHandlers[Any](
+            poll=poll,
+            watch=watch,
+            wait=wait,
+            fetch_result=fetch_result,
+        )
+
+    def purge_expired_records(self) -> int:
+        """Remove records past the configured TTL; no-op without a ledger."""
+        if self._ledger is None:
+            return 0
+        return self._ledger.purge_expired()
 
     def _submit_convert_task(
         self,
@@ -1379,46 +1731,108 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
         request_headers: dict[str, str] | None = None,
         materialize_presigned: bool = False,
     ) -> ConversionJob[ConversionResult] | ConversionJob[PresignedUrlConvertResponse]:
-        try:
+        if self._ledger is None:
+            try:
+                return self._submit_conversion_job(
+                    source=source,
+                    options=options,
+                    limits=limits,
+                    target=PresignedUrlTarget(),
+                    descriptor=descriptor,
+                    request_headers=request_headers,
+                    materialize_presigned=materialize_presigned,
+                )
+            except ServiceError as exc:
+                if not self._should_fallback_from_presigned_target(exc):
+                    raise
             return self._submit_conversion_job(
                 source=source,
-                options=options,
+                options=self._options_for_output_formats(
+                    options,
+                    output_formats=None,
+                    target=InBodyTarget(),
+                ),
                 limits=limits,
-                target=PresignedUrlTarget(),
+                target=InBodyTarget(),
                 descriptor=descriptor,
                 request_headers=request_headers,
                 materialize_presigned=materialize_presigned,
             )
-        except ServiceError as exc:
-            if not self._should_fallback_from_presigned_target(exc):
-                raise
-        return self._submit_conversion_job(
-            source=source,
-            options=self._options_for_output_formats(
+
+        fingerprint = self._fingerprint(
+            {
+                "jk": "convert",
+                "src": self._source_fingerprint(source),
+                "opt": options.model_dump(mode="json"),
+                "tgt": ("auto",),
+                "mat": materialize_presigned,
+                "hdr": self._headers_fingerprint(request_headers),
+            }
+        )
+        actual_target_kind: dict[str, str] = {}
+
+        def do_submit() -> TaskStatusResponse:
+            try:
+                status = self._submit_convert_task(
+                    source=source,
+                    options=options,
+                    target=PresignedUrlTarget(),
+                    request_headers=request_headers,
+                )
+                actual_target_kind["tk"] = "presigned_url"
+                return status
+            except ServiceError as exc:
+                if not self._should_fallback_from_presigned_target(exc):
+                    raise
+            inbody = InBodyTarget()
+            fallback_options = self._options_for_output_formats(
                 options,
                 output_formats=None,
-                target=InBodyTarget(),
-            ),
+                target=inbody,
+            )
+            status = self._submit_convert_task(
+                source=source,
+                options=fallback_options,
+                target=inbody,
+                request_headers=request_headers,
+            )
+            actual_target_kind["tk"] = "inbody"
+            return status
+
+        def details_factory(initial: TaskStatusResponse) -> dict[str, Any]:
+            return _convert_details(
+                descriptor=descriptor,
+                target_kind=actual_target_kind["tk"],
+                materialize=materialize_presigned,
+            )
+
+        initial_status, record = self._orchestrate_task(
+            fingerprint=fingerprint,
+            do_submit=do_submit,
+            details_factory=details_factory,
+        )
+        return self._assemble_after_orchestration(
+            fingerprint=fingerprint,
+            initial_status=initial_status,
+            record=record,
+            fresh_descriptor=descriptor,
             limits=limits,
-            target=InBodyTarget(),
-            descriptor=descriptor,
-            request_headers=request_headers,
-            materialize_presigned=materialize_presigned,
         )
 
     def _make_convert_fetch_result_handler(
         self,
         descriptor: _SourceDescriptor,
         limits: DocumentLimits,
-        target: SubmitTarget,
+        target: SubmitTarget | _TargetMarker,
         materialize_presigned: bool = False,
     ) -> Any:
-        if isinstance(target, ZipTarget):
+        kind = target.kind
+        if kind == "zip":
             return lambda task_id, last_status: self._fetch_raw_result(
                 task_id=task_id,
                 last_status=last_status,
             )
-        if isinstance(target, PresignedUrlTarget):
+        if kind == "presigned_url":
             if materialize_presigned:
                 # High-level convert(): download the presigned artifacts and
                 # rebuild a ConversionResult instead of returning the raw URLs.
@@ -1434,7 +1848,7 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
                 task_id=task_id,
                 last_status=last_status,
             )
-        if _is_storage_target(target):
+        if kind in _STORAGE_TARGET_KINDS:
             return lambda task_id, last_status: self._fetch_presigned_document_result(
                 task_id=task_id,
                 last_status=last_status,
@@ -1459,17 +1873,49 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
         ConversionJob[PresignedUrlConvertDocumentResponse]
         | ConversionJob[PresignedUrlConvertResponse]
     ):
-        initial_status = self._submit_batch_task(
-            sources=sources,
-            options=options,
-            target=target,
-            targets=targets,
-            request_headers=request_headers,
-        )
         all_targets = (
-            targets if targets is not None else ([target] if target is not None else [])
+            list(targets)
+            if targets is not None
+            else ([target] if target is not None else [])
         )
-        if any(_is_storage_target(t) for t in all_targets):
+        storage_like = any(_is_storage_target(t) for t in all_targets)
+        fingerprint: str | None = None
+        if self._ledger is not None:
+            fingerprint = self._fingerprint(
+                {
+                    "jk": "batch",
+                    "src": [_sanitize_model(source) for source in sources],
+                    "tgt": [_sanitize_model(t) for t in all_targets],
+                    "opt": options.model_dump(mode="json"),
+                    "hdr": self._headers_fingerprint(request_headers),
+                }
+            )
+            initial_status, _record = self._orchestrate_task(
+                fingerprint=fingerprint,
+                do_submit=lambda: self._submit_batch_task(
+                    sources=sources,
+                    options=options,
+                    target=target,
+                    targets=targets,
+                    request_headers=request_headers,
+                ),
+                details_factory=lambda initial: {
+                    "jk": "batch",
+                    "storage": storage_like,
+                },
+            )
+            if _record is not None:
+                storage_like = bool(_record.details.get("storage", False))
+        else:
+            initial_status = self._submit_batch_task(
+                sources=sources,
+                options=options,
+                target=target,
+                targets=targets,
+                request_headers=request_headers,
+            )
+
+        if storage_like:
 
             def fetch_result(
                 task_id: str,
@@ -1496,6 +1942,8 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
             wait=self._wait_for_terminal_status,
             fetch_result=fetch_result,
         )
+        if fingerprint is not None and self._ledger is not None:
+            handlers = self._ledered_handlers(fingerprint, handlers)
         return ConversionJob(
             task_id=initial_status.task_id,
             submitted_at=datetime.now(tz=timezone.utc),
@@ -2144,6 +2592,7 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
             http_retries=self._http_retries,
             http_connect_timeout=self._http_connect_timeout,
             http_read_timeout=self._http_read_timeout,
+            ledger=self._ledger_config,
         )
 
     async def _convert_all_async(

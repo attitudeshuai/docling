@@ -8,8 +8,10 @@ import queue
 import tempfile
 import threading
 import time
+import uuid
 import warnings
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from pathlib import Path, PurePath
@@ -48,6 +50,8 @@ from docling.datamodel.service.requests import (
     S3SourceRequest,
 )
 from docling.datamodel.service.responses import (
+    ConvertDocumentResponse,
+    ExportDocumentResponse,
     FailureCategory,
     FailurePhase,
     MessageKind,
@@ -73,7 +77,9 @@ from docling.service_client import (
     ChunkerKind,
     ConversionItem,
     DoclingServiceClient,
+    JobLedgerConfig,
 )
+from docling.service_client.client import SubmitTarget
 from docling.service_client.exceptions import (
     ArtifactDownloadError,
     ConversionError,
@@ -82,9 +88,11 @@ from docling.service_client.exceptions import (
     ServiceError,
     ServiceUnavailableError,
     TaskExecutionError,
+    TaskNotFoundError,
     UsageLimitExceededError,
 )
 from docling.service_client.job import ConversionJob, _JobHandlers
+from docling.service_client.ledger import _LedgerRecord
 from docling.service_client.watchers import AsyncPollingWatcher, PollingWatcher
 
 TEST_BASE_URL = "http://docling-service.invalid"
@@ -4409,3 +4417,516 @@ async def test_async_client_stamps_accept_doc_version_header() -> None:
         assert (
             client._async_client.headers[_ACCEPT_DOC_VERSION_HEADER] == CURRENT_VERSION
         )
+
+
+# ---------------------------------------------------------------------------
+# Local job ledger
+# ---------------------------------------------------------------------------
+
+LEDGER_SOURCE_URL = "https://example.org/sample.pdf"
+
+
+class _FakeService:
+    """Minimal in-memory docling-serve behind an httpx.MockTransport."""
+
+    def __init__(
+        self,
+        *,
+        statuses: list[str] | None = None,
+        known: bool = True,
+    ) -> None:
+        self.post_count = 0
+        self.poll_count = 0
+        self.result_count = 0
+        self._statuses = list(statuses or [])
+        self._known = known
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.release.set()
+        document = DoclingDocument(name="sample")
+        self._result_payload = json.loads(
+            ConvertDocumentResponse(
+                document=ExportDocumentResponse(
+                    filename="sample.pdf",
+                    md_content="# sample",
+                    json_content=document,
+                ),
+                status=ConversionStatus.SUCCESS,
+                processing_time=0.25,
+            ).model_dump_json()
+        )
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v1/convert/source/async":
+            self.post_count += 1
+            self.started.set()
+            self.release.wait(timeout=15)
+            return httpx.Response(
+                200,
+                json=_status_response("task-1", "pending").model_dump(mode="json"),
+            )
+        if "/status/poll/" in path:
+            self.poll_count += 1
+            if not self._known:
+                return httpx.Response(404, json={"detail": "Task not found."})
+            status = self._statuses.pop(0) if self._statuses else "success"
+            return httpx.Response(
+                200,
+                json=_status_response("task-1", status).model_dump(mode="json"),
+            )
+        if path.startswith("/v1/result/"):
+            self.result_count += 1
+            return httpx.Response(200, json=self._result_payload)
+        return httpx.Response(404, json={"detail": "not found"})
+
+
+@contextmanager
+def _ledered_client(
+    fake: _FakeService,
+    ledger_config: JobLedgerConfig | None,
+    *,
+    status_watcher: StatusWatcherKind = StatusWatcherKind.POLLING,
+):
+    with DoclingServiceClient(
+        url=TEST_BASE_URL,
+        ledger=ledger_config,
+        status_watcher=status_watcher,
+    ) as client:
+        client._http_client.close()
+        client._http_client = httpx.Client(
+            transport=httpx.MockTransport(fake.handler),
+            timeout=client._http_client.timeout,
+        )
+        yield client
+
+
+def _seed_record(
+    client: DoclingServiceClient,
+    *,
+    source: str,
+    target: SubmitTarget,
+    state: str,
+    task_id: str | None = None,
+    task_status: str | None = None,
+    details: dict[str, object] | None = None,
+    age: timedelta | None = None,
+) -> _LedgerRecord:
+    """Write one record directly, bypassing the network flow."""
+    resolved = client._resolve_options(
+        options=None,
+        max_num_pages=None,
+        max_file_size=None,
+        page_range=None,
+    )
+    submit_options = client._options_for_output_formats(
+        resolved.options, output_formats=None, target=target
+    )
+    fingerprint = client._fingerprint(
+        {
+            "jk": "convert",
+            "src": client._source_fingerprint(source),
+            "opt": submit_options.model_dump(mode="json"),
+            "tgt": ("explicit", client_module._sanitize_model(target)),
+            "mat": False,
+            "hdr": client._headers_fingerprint(None),
+        }
+    )
+    now = datetime.now(timezone.utc)
+    record = _LedgerRecord(
+        fingerprint=fingerprint,
+        state=state,
+        token=uuid.uuid4().hex,
+        intent_at=now,
+        updated_at=now,
+        task_id=task_id,
+        task_status=task_status,
+        details=details or {},
+    )
+    if age is not None:
+        record.intent_at = now - age
+        record.updated_at = now - age
+    ledger = client._ledger
+    assert ledger is not None
+    with ledger._lock:
+        records = ledger._read_locked()
+        records.append(record)
+        ledger._write_locked(records)
+    return record
+
+
+def _convert_record_details() -> dict[str, object]:
+    return {
+        "jk": "convert",
+        "src": "sample.pdf",
+        "fmt": "pdf",
+        "size": None,
+        "tk": "inbody",
+        "mat": False,
+    }
+
+
+def test_ledger_disabled_by_default_no_file_and_two_posts(
+    tmp_path: Path,
+) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    fake = _FakeService()
+    with _ledered_client(fake, ledger_config=None) as client:
+        assert client._ledger is None
+        job1 = client.submit(source=LEDGER_SOURCE_URL, target=InBodyTarget())
+        job2 = client.submit(source=LEDGER_SOURCE_URL, target=InBodyTarget())
+
+    assert fake.post_count == 2
+    assert job1.task_id == job2.task_id == "task-1"
+    assert not ledger_path.exists()
+    assert not (tmp_path / ".ledger.jsonl.lock").exists()
+
+
+def test_ledger_submits_once_and_reattaches_across_clients(
+    tmp_path: Path,
+) -> None:
+    ledger_config = JobLedgerConfig(path=tmp_path / "ledger.jsonl", auto_cleanup=False)
+    fake = _FakeService()
+    with _ledered_client(fake, ledger_config) as client:
+        job1 = client.submit(source=LEDGER_SOURCE_URL, target=InBodyTarget())
+    assert fake.post_count == 1
+    assert job1.task_id == "task-1"
+
+    # Simulate a restart: a brand-new client on the same ledger.
+    with _ledered_client(fake, ledger_config) as client:
+        job2 = client.submit(source=LEDGER_SOURCE_URL, target=InBodyTarget())
+        result = job2.result(timeout=5)
+
+    assert fake.post_count == 1  # no resubmission
+    assert job2.task_id == "task-1"
+    assert result.status == ConversionStatus.SUCCESS
+
+
+def test_ledger_completed_task_returns_result_directly(
+    tmp_path: Path,
+) -> None:
+    ledger_config = JobLedgerConfig(path=tmp_path / "ledger.jsonl", auto_cleanup=False)
+    fake = _FakeService()
+    with _ledered_client(fake, ledger_config) as client:
+        _seed_record(
+            client,
+            source=LEDGER_SOURCE_URL,
+            target=InBodyTarget(),
+            state="succeeded",
+            task_id="task-1",
+            task_status="success",
+            details=_convert_record_details(),
+        )
+        job = client.submit(source=LEDGER_SOURCE_URL, target=InBodyTarget())
+        assert job.done is True
+        result = job.result(timeout=5)
+
+    assert result.status == ConversionStatus.SUCCESS
+    assert fake.post_count == 0
+    assert fake.poll_count == 1  # reattachment probe only
+    assert fake.result_count == 1
+
+
+def test_ledger_inprogress_task_continues_waiting_after_reattach(
+    tmp_path: Path,
+) -> None:
+    ledger_config = JobLedgerConfig(path=tmp_path / "ledger.jsonl", auto_cleanup=False)
+    # Probe consumes the first "pending"; the wait loop then sees "success".
+    fake = _FakeService(statuses=["pending", "success"])
+    with _ledered_client(fake, ledger_config) as client:
+        _seed_record(
+            client,
+            source=LEDGER_SOURCE_URL,
+            target=InBodyTarget(),
+            state="submitted",
+            task_id="task-1",
+            task_status="pending",
+            details=_convert_record_details(),
+        )
+        job = client.submit(source=LEDGER_SOURCE_URL, target=InBodyTarget())
+        assert job.done is False
+        result = job.result(timeout=5)
+
+    assert result.status == ConversionStatus.SUCCESS
+    assert fake.post_count == 0
+
+
+def test_ledger_raises_when_service_forgets_task(tmp_path: Path) -> None:
+    ledger_config = JobLedgerConfig(path=tmp_path / "ledger.jsonl", auto_cleanup=False)
+    fake = _FakeService(known=False)
+    with _ledered_client(fake, ledger_config) as client:
+        _seed_record(
+            client,
+            source=LEDGER_SOURCE_URL,
+            target=InBodyTarget(),
+            state="submitted",
+            task_id="task-1",
+            task_status="pending",
+            details=_convert_record_details(),
+        )
+        with pytest.raises(TaskNotFoundError, match="no longer known"):
+            client.submit(source=LEDGER_SOURCE_URL, target=InBodyTarget())
+
+    # Record is now orphaned; a later caller fails fast without any HTTP call.
+    fake2 = _FakeService()
+    with _ledered_client(fake2, ledger_config) as client:
+        with pytest.raises(TaskNotFoundError, match="no longer known"):
+            client.submit(source=LEDGER_SOURCE_URL, target=InBodyTarget())
+        assert fake2.post_count == 0
+        assert fake2.poll_count == 0
+
+
+def test_ledger_distinct_settings_submit_separately(tmp_path: Path) -> None:
+    ledger_config = JobLedgerConfig(path=tmp_path / "ledger.jsonl", auto_cleanup=False)
+    fake = _FakeService()
+    with _ledered_client(fake, ledger_config) as client:
+        client.submit(source=LEDGER_SOURCE_URL, target=InBodyTarget())
+        client.submit(
+            source=LEDGER_SOURCE_URL,
+            target=InBodyTarget(),
+            options=ConvertDocumentsRequestOptions(do_ocr=False),
+        )
+
+    assert fake.post_count == 2
+
+
+def test_ledger_concurrent_processes_submit_once(tmp_path: Path) -> None:
+    ledger_config = JobLedgerConfig(path=tmp_path / "ledger.jsonl", auto_cleanup=False)
+    fake = _FakeService()
+    fake.release.clear()  # keep the first POST blocked until we assert single submit
+    outcomes: dict[str, ConversionJob] = {}
+
+    def submit_one(name: str) -> None:
+        with _ledered_client(fake, ledger_config) as client:
+            outcomes[name] = client.submit(
+                source=LEDGER_SOURCE_URL, target=InBodyTarget()
+            )
+
+    t1 = threading.Thread(target=submit_one, args=("first",))
+    t1.start()
+    assert fake.started.wait(timeout=5)
+
+    t2 = threading.Thread(target=submit_one, args=("second",))
+    t2.start()
+    time.sleep(0.6)
+    assert fake.post_count == 1  # peer is waiting, not submitting
+
+    fake.release.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    job1 = outcomes["first"]
+    job2 = outcomes["second"]
+    assert job1.task_id == job2.task_id == "task-1"
+    assert fake.post_count == 1
+    assert job2.done is True
+
+
+def test_ledger_stale_intent_is_taken_over(tmp_path: Path) -> None:
+    ledger_config = JobLedgerConfig(
+        path=tmp_path / "ledger.jsonl",
+        auto_cleanup=False,
+        takeover_timeout=10.0,
+    )
+    fake = _FakeService()
+    with _ledered_client(fake, ledger_config) as client:
+        # Register an intent, then backdate it as if its owner died submitting.
+        record = _seed_record(
+            client,
+            source=LEDGER_SOURCE_URL,
+            target=InBodyTarget(),
+            state="intended",
+            age=timedelta(seconds=40),
+        )
+        old_token = record.token
+        job = client.submit(source=LEDGER_SOURCE_URL, target=InBodyTarget())
+
+    assert fake.post_count == 1
+    assert job.task_id == "task-1"
+    assert job._handlers is not None
+    stored = client._ledger.get_record(record.fingerprint)
+    assert stored is not None and stored.token != old_token
+
+
+def test_ledger_skips_corrupt_records_and_repairs_file(
+    tmp_path: Path,
+) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    ledger_config = JobLedgerConfig(path=ledger_path, auto_cleanup=False)
+    fake = _FakeService()
+    with _ledered_client(fake, ledger_config) as client:
+        valid = _seed_record(
+            client,
+            source=LEDGER_SOURCE_URL,
+            target=InBodyTarget(),
+            state="submitted",
+            task_id="task-1",
+            task_status="pending",
+            details=_convert_record_details(),
+        )
+        ledger_path.write_text(
+            "\n".join(
+                [
+                    "not json at all",
+                    '{"fp": "x", "st": 123}',
+                    "{broken",
+                    ledger_path.read_text(encoding="utf-8").strip(),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        # Valid record still reattaches despite the garbage around it.
+        job = client.submit(source=LEDGER_SOURCE_URL, target=InBodyTarget())
+        assert job.task_id == "task-1"
+
+    raw = ledger_path.read_text(encoding="utf-8")
+    assert valid.fingerprint in raw
+    assert "not json at all" not in raw and "{broken" not in raw
+
+
+def test_ledger_purge_removes_expired_records(tmp_path: Path) -> None:
+    ledger_config = JobLedgerConfig(
+        path=tmp_path / "ledger.jsonl",
+        auto_cleanup=False,
+        record_ttl=timedelta(days=7),
+    )
+    fake = _FakeService()
+    with _ledered_client(fake, ledger_config) as client:
+        _seed_record(
+            client,
+            source="https://example.org/old.pdf",
+            target=InBodyTarget(),
+            state="succeeded",
+            task_id="old-task",
+            task_status="success",
+            age=timedelta(days=8),
+        )
+        _seed_record(
+            client,
+            source="https://example.org/gone.pdf",
+            target=InBodyTarget(),
+            state="orphaned",
+            task_id="orphan-task",
+            task_status="pending",
+            age=timedelta(days=8),
+        )
+        fresh = _seed_record(
+            client,
+            source="https://example.org/new.pdf",
+            target=InBodyTarget(),
+            state="succeeded",
+            task_id="new-task",
+            task_status="success",
+        )
+        removed = client.purge_expired_records()
+
+    assert removed == 2
+    with _ledered_client(fake, ledger_config) as client:
+        assert client._ledger.get_record(fresh.fingerprint) is not None
+
+
+def test_ledger_does_not_store_credentials(tmp_path: Path) -> None:
+    ledger_config = JobLedgerConfig(path=tmp_path / "ledger.jsonl", auto_cleanup=False)
+    fake = _FakeService()
+    s3_target = S3Target(
+        endpoint="s3.example.com",
+        access_key="AKIASECRETACCESS",
+        secret_key="plaintext-secret-key-value",
+        bucket="my-bucket",
+        key_prefix="prefix/",
+    )
+    with DoclingServiceClient(
+        url=TEST_BASE_URL,
+        api_key="secret-api-key",
+        ledger=ledger_config,
+        status_watcher=StatusWatcherKind.POLLING,
+    ) as client:
+        client._http_client.close()
+        client._http_client = httpx.Client(
+            transport=httpx.MockTransport(fake.handler),
+            timeout=client._http_client.timeout,
+        )
+        source = HttpSourceRequest(
+            url=LEDGER_SOURCE_URL,
+            headers={"Authorization": "Bearer token-secret-value"},
+        )
+        client.submit(
+            source=source,
+            target=s3_target,
+            headers={"X-Tenant-Id": "tenant-a"},
+        )
+
+    raw = ledger_config.path.read_text(encoding="utf-8")
+    for secret in (
+        "AKIASECRETACCESS",
+        "plaintext-secret-key-value",
+        "secret-api-key",
+        "token-secret-value",
+    ):
+        assert secret not in raw
+
+
+@pytest.mark.anyio
+async def test_async_ledger_reattaches_and_fetches(tmp_path: Path) -> None:
+    ledger_config = JobLedgerConfig(path=tmp_path / "ledger.jsonl", auto_cleanup=False)
+    fake = _FakeService()
+    async with AsyncDoclingServiceClient(
+        url=TEST_BASE_URL,
+        ledger=ledger_config,
+        status_watcher=StatusWatcherKind.POLLING,
+    ) as client:
+        # Point the async client at the in-memory fake service.
+        assert client._async_client is not None
+        headers = dict(client._async_client.headers)
+        timeout = client._async_client.timeout
+        await client._async_client.aclose()
+        client._async_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(fake.handler),
+            timeout=timeout,
+            headers=headers,
+        )
+
+        # Seed via the same storage layer the async client uses.
+        resolved = client._resolve_options(
+            options=None,
+            max_num_pages=None,
+            max_file_size=None,
+            page_range=None,
+        )
+        submit_options = client._options_for_output_formats(
+            resolved.options, output_formats=None, target=InBodyTarget()
+        )
+        fingerprint = client._fingerprint(
+            {
+                "jk": "convert",
+                "src": client._source_fingerprint(LEDGER_SOURCE_URL),
+                "opt": submit_options.model_dump(mode="json"),
+                "tgt": ("explicit", client_module._sanitize_model(InBodyTarget())),
+                "mat": False,
+                "hdr": client._headers_fingerprint(None),
+            }
+        )
+        now = datetime.now(timezone.utc)
+        record = _LedgerRecord(
+            fingerprint=fingerprint,
+            state="succeeded",
+            token=uuid.uuid4().hex,
+            intent_at=now,
+            updated_at=now,
+            task_id="task-1",
+            task_status="success",
+            details=_convert_record_details(),
+        )
+        ledger = client._ledger
+        assert ledger is not None
+        with ledger._lock:
+            records = ledger._read_locked()
+            records.append(record)
+            ledger._write_locked(records)
+
+        job = await client.submit(source=LEDGER_SOURCE_URL, target=InBodyTarget())
+        result = await job.result(timeout=5)
+
+    assert result.status == ConversionStatus.SUCCESS
+    assert fake.post_count == 0
