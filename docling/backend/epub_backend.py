@@ -6,7 +6,6 @@ import logging
 import posixpath
 import re
 import shutil
-import tempfile
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import unquote
@@ -23,6 +22,7 @@ from docling.datamodel.backend_options import EpubBackendOptions, HTMLBackendOpt
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.document import InputDocument
 from docling.exceptions import DocumentLoadError
+from docling.utils.workspace import workspace_mkdtemp
 
 _log = logging.getLogger(__name__)
 
@@ -382,7 +382,7 @@ class EpubDocumentBackend(DeclarativeDocumentBackend):
         # This allows the HTML backend to access images from the filesystem
         if self.options.fetch_images and self.options.enable_local_fetch:
             try:
-                self.temp_dir = Path(tempfile.mkdtemp(prefix="docling_epub_"))
+                self.temp_dir = workspace_mkdtemp(prefix="docling_epub_", owner=self)
                 _log.debug(f"Extracting EPUB to temporary directory: {self.temp_dir}")
                 if not self._safe_extract_epub(self.temp_dir):
                     _log.warning(

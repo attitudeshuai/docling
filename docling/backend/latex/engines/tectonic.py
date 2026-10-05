@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import threading
 from pathlib import Path
 
@@ -15,6 +14,7 @@ from PIL import Image, ImageChops
 
 from docling.backend.latex.engines.base import RenderEngine
 from docling.backend.latex.utils.encoding import decode_latex_content
+from docling.utils.workspace import workspace_temp_directory
 
 _log = logging.getLogger(__name__)
 _PYPDFIUM2_LOCK = threading.Lock()
@@ -309,8 +309,7 @@ class TectonicEngine(RenderEngine):
             + "\\end{document}\n"
         )
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
+        with workspace_temp_directory() as temp_path:
             self._stage_local_dependencies(temp_path, preamble, tikz_code, source_root)
             tex_file = temp_path / "diagram.tex"
             tex_file.write_text(latex_doc, encoding="utf-8")
@@ -325,7 +324,7 @@ class TectonicEngine(RenderEngine):
             try:
                 subprocess.run(
                     cmd,
-                    cwd=temp_dir,
+                    cwd=temp_path,
                     capture_output=True,
                     check=True,
                     timeout=self.timeout,

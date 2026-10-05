@@ -9,6 +9,8 @@ from typing import Annotated, Iterator, Optional, Tuple
 from pydantic import AfterValidator, BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from docling.utils.workspace import WorkspaceSettings
+
 
 def _validate_page_range(v: Tuple[int, int]) -> Tuple[int, int]:
     if v[0] < 1 or v[1] < v[0]:
@@ -66,6 +68,7 @@ class AppSettings(BaseSettings):
     perf: BatchConcurrencySettings = BatchConcurrencySettings()
     debug: DebugSettings = DebugSettings()
     inference: InferenceSettings = InferenceSettings()
+    workspace: WorkspaceSettings = WorkspaceSettings()
 
     cache_dir: Path = Path.home() / ".cache" / "docling"
     artifacts_path: Optional[Path] = None
@@ -85,12 +88,14 @@ def scoped(
     perf: BatchConcurrencySettings | None = None,
     debug: DebugSettings | None = None,
     inference: InferenceSettings | None = None,
+    workspace: WorkspaceSettings | None = None,
 ) -> Iterator[AppSettings]:
     """Temporarily override selected settings and restore them on exit."""
     saved = {
         "perf": settings.perf.model_copy(deep=True),
         "debug": settings.debug.model_copy(deep=True),
         "inference": settings.inference.model_copy(deep=True),
+        "workspace": settings.workspace.model_copy(deep=True),
     }
 
     try:
@@ -100,11 +105,14 @@ def scoped(
             settings.debug = debug
         if inference is not None:
             settings.inference = inference
+        if workspace is not None:
+            settings.workspace = workspace
         yield settings
     finally:
         settings.perf = saved["perf"].model_copy(deep=True)
         settings.debug = saved["debug"].model_copy(deep=True)
         settings.inference = saved["inference"].model_copy(deep=True)
+        settings.workspace = saved["workspace"].model_copy(deep=True)
 
 
 def default_compile_model() -> bool:

@@ -17,6 +17,7 @@ from docling.datamodel.backend_options import (
 if TYPE_CHECKING:
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.document import InputDocument
+    from docling.utils.workspace import DocumentWorkspace
 
 
 class AbstractDocumentBackend(ABC):
@@ -32,6 +33,7 @@ class AbstractDocumentBackend(ABC):
         self.document_hash = in_doc.document_hash
         self.input_format = in_doc.format
         self.options = BaseBackendOptions() if options is None else options
+        self.workspace: Optional[DocumentWorkspace] = in_doc.workspace
 
     @abstractmethod
     def is_valid(self) -> bool:

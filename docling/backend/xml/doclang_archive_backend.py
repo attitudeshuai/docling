@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: MIT
 
 import shutil
-import tempfile
 from io import BytesIO
 from pathlib import Path
 from typing import Union
@@ -13,6 +12,7 @@ from typing_extensions import override
 from docling.backend.abstract_backend import DeclarativeDocumentBackend
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.document import InputDocument
+from docling.utils.workspace import workspace_mkdtemp
 
 _DCLX_MIMETYPE = "application/zip"
 
@@ -45,7 +45,7 @@ class DocLangArchiveBackend(DeclarativeDocumentBackend):
             if isinstance(self.path_or_stream, Path):
                 doc = DoclingDocument.load_from_doclang_archive(self.path_or_stream)
             elif isinstance(self.path_or_stream, BytesIO):
-                self._temp_dir = Path(tempfile.mkdtemp(prefix="docling_dclx_"))
+                self._temp_dir = workspace_mkdtemp(prefix="docling_dclx_", owner=self)
                 archive_path = self._temp_dir / (self.file.name or "document.dclx")
                 archive_path.write_bytes(self.path_or_stream.getvalue())
                 artifacts_dir = self._temp_dir / "artifacts"

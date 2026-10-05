@@ -30,13 +30,13 @@ import zipfile
 from collections.abc import Callable, Sequence
 from io import BytesIO
 from pathlib import Path
-from tempfile import mkdtemp
 from xml.sax.saxutils import escape
 
 from PIL import Image
 
 from docling.backend.docx.drawingml.utils import crop_whitespace
 from docling.backend.iwork.content import Chart, ChartKind, ChartSeries, Geometry
+from docling.utils.workspace import workspace_mkdtemp
 
 _log = logging.getLogger(__name__)
 
@@ -212,7 +212,7 @@ def render_chart(
     if document is None:
         return None
 
-    temp_dir = Path(mkdtemp())
+    temp_dir = workspace_mkdtemp()
     try:
         input_path = temp_dir / "chart.docx"
         output_path = temp_dir / "chart.pdf"

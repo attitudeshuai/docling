@@ -26,7 +26,6 @@ import zipfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Final
 
 from docling_core.types.doc import (
@@ -46,6 +45,7 @@ from docling.datamodel.backend_options import HTMLBackendOptions, XBRLBackendOpt
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.document import InputDocument
 from docling.exceptions import DocumentLoadError, OperationNotAllowed
+from docling.utils.workspace import workspace_temp_directory
 
 _XBRL_AVAILABLE: bool = False
 _XBRL_IMPORT_ERROR: ImportError | None = None
@@ -119,8 +119,8 @@ class XBRLDocumentBackend(DeclarativeDocumentBackend):
                     " 'options.enable_remote_fetch=True'. Either one or the other"
                     " needs to be enabled to load taxonomies."
                 )
-            with TemporaryDirectory() as tmpdir:
-                tmp_path: Path = Path(tmpdir)
+            with workspace_temp_directory(owner=self) as tmpdir:
+                tmp_path: Path = tmpdir
                 zip_paths: list[str] = []
                 if self.options.taxonomy:
                     taxonomy: Path = self.options.taxonomy.resolve()

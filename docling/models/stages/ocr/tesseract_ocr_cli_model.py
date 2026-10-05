@@ -7,7 +7,6 @@ import logging
 import os
 import re
 import subprocess
-import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from subprocess import DEVNULL, PIPE, Popen
@@ -40,6 +39,7 @@ from docling.utils.ocr_language import (
     OcrLanguageSupport,
 )
 from docling.utils.profiling import TimeRecorder
+from docling.utils.workspace import workspace_named_temp_file
 
 _log = logging.getLogger(__name__)
 
@@ -337,8 +337,11 @@ class TesseractOcrCliModel(BaseOcrModel):
                             scale=self.scale, cropbox=ocr_rect
                         )
                         try:
-                            with tempfile.NamedTemporaryFile(
-                                suffix=".png", mode="w+b", delete=False
+                            with workspace_named_temp_file(
+                                suffix=".png",
+                                mode="w+b",
+                                delete=False,
+                                owner=conv_res.input,
                             ) as image_file:
                                 fname = image_file.name
                                 high_res_image.save(image_file)

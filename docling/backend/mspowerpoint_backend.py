@@ -9,7 +9,6 @@ import warnings
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from tempfile import mkdtemp
 from typing import Any, Callable, Final, Iterable, Iterator, Optional, Union
 
 from docling_core.types.doc import (
@@ -50,6 +49,7 @@ from docling.datamodel.backend_options import MsPowerpointBackendOptions
 from docling.datamodel.base_models import FormatToMimeType, InputFormat
 from docling.datamodel.document import InputDocument
 from docling.exceptions import DocumentLoadError
+from docling.utils.workspace import workspace_mkdtemp
 
 _log = logging.getLogger(__name__)
 
@@ -885,7 +885,7 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
             return None
 
         suffix = ".wmf" if image_bytes[:4] == _WMF_PLACEABLE_MAGIC else ".emf"
-        temp_dir = Path(mkdtemp())
+        temp_dir = workspace_mkdtemp(owner=self)
         try:
             input_path = temp_dir / f"image{suffix}"
             output_path = temp_dir / "image.pdf"
@@ -1419,7 +1419,7 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
         if converter is None:
             return None
 
-        temp_dir = Path(mkdtemp())
+        temp_dir = workspace_mkdtemp(owner=self)
         try:
             input_path = temp_dir / "chart.pptx"
             output_path = temp_dir / "chart.pdf"

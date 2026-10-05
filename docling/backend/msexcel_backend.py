@@ -12,7 +12,6 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from tempfile import mkdtemp
 from typing import Annotated, Any, Callable, Final, cast
 from zipfile import ZipFile
 
@@ -56,6 +55,7 @@ from docling.datamodel.backend_options import MsExcelBackendOptions
 from docling.datamodel.base_models import FormatToMimeType, InputFormat
 from docling.datamodel.document import InputDocument
 from docling.exceptions import DocumentLoadError
+from docling.utils.workspace import workspace_mkdtemp
 
 _log = logging.getLogger(__name__)
 
@@ -1250,7 +1250,7 @@ class MsExcelDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentBacken
 
         # WMF placeable magic: D7 CD C6 9A; everything else we treat as EMF.
         suffix = ".wmf" if image_bytes[:4] == b"\xd7\xcd\xc6\x9a" else ".emf"
-        temp_dir = Path(mkdtemp())
+        temp_dir = workspace_mkdtemp(owner=self)
         try:
             input_path = temp_dir / f"image{suffix}"
             output_path = temp_dir / "image.pdf"
@@ -1716,7 +1716,7 @@ class MsExcelDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentBacken
         if standalone is None:
             return None
 
-        temp_dir = Path(mkdtemp())
+        temp_dir = workspace_mkdtemp(owner=self)
         try:
             input_path = temp_dir / "chart.xlsx"
             output_path = temp_dir / "chart.pdf"

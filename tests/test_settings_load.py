@@ -11,12 +11,16 @@ def _setup_env(monkeypatch):
     monkeypatch.setenv("DOCLING_DEBUG_VISUALIZE_RAW_LAYOUT", "True")
     monkeypatch.setenv("DOCLING_ARTIFACTS_PATH", "/path/to/artifacts")
     monkeypatch.setenv("DOCLING_INFERENCE_COMPILE_TORCH_MODELS", "True")
+    monkeypatch.setenv("DOCLING_WORKSPACE_ENABLED", "True")
+    monkeypatch.setenv("DOCLING_WORKSPACE_ROOT", "/path/to/workspace")
+    monkeypatch.setenv("DOCLING_WORKSPACE_MAX_SIZE_BYTES", "1024")
 
 
 def test_settings(monkeypatch):
     _setup_env(monkeypatch)
 
     import importlib
+    from pathlib import Path
 
     import docling.datamodel.settings as m
 
@@ -24,16 +28,22 @@ def test_settings(monkeypatch):
     importlib.reload(m)
 
     # Check top level setting
-    assert str(m.settings.artifacts_path) == "/path/to/artifacts"
+    assert m.settings.artifacts_path == Path("/path/to/artifacts")
 
     # Check nested set via environment variables
     assert m.settings.perf.page_batch_size == 12
     assert m.settings.debug.visualize_raw_layout is True
     assert m.settings.inference.compile_torch_models is True
 
+    # Workspace governance is configured from the environment too.
+    assert m.settings.workspace.enabled is True
+    assert m.settings.workspace.root == Path("/path/to/workspace")
+    assert m.settings.workspace.max_size_bytes == 1024
+
     # Check nested defaults
     assert m.settings.perf.doc_batch_size == 1
     assert m.settings.debug.visualize_ocr is False
+    assert m.settings.workspace.limit_policy.value == "fallback"
 
 
 def test_compile_model_defaults_from_settings(monkeypatch):

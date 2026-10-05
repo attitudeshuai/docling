@@ -14,7 +14,6 @@ Orchestrates three steps:
 
 import logging
 import shutil
-import tempfile
 from io import BytesIO
 from pathlib import Path
 
@@ -58,6 +57,11 @@ from docling.utils.video_frame_sampling import (
     ffmpeg_input_args,
     probe_duration,
     unsupported_container_message,
+)
+from docling.utils.workspace import (
+    resolve_workspace,
+    workspace_materialize,
+    workspace_named_temp_file,
 )
 
 _log = logging.getLogger(__name__)
@@ -159,9 +163,9 @@ class VideoPipeline(BasePipeline):
 
         if isinstance(path_or_stream, BytesIO):
             suffix = Path(conv_res.input.file.name).suffix or ".mp4"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-                f.write(path_or_stream.getvalue())
-                temp_video = Path(f.name)
+            temp_video = workspace_materialize(
+                path_or_stream.getvalue(), suffix=suffix, owner=conv_res.input
+            )
             video_path = temp_video
         elif isinstance(path_or_stream, Path):
             video_path = path_or_stream
@@ -208,12 +212,32 @@ class VideoPipeline(BasePipeline):
 
             # 3. Extract audio and transcribe
             transcript_items = []
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wf:
-                wav_path = Path(wf.name)
+            workspace = resolve_workspace(conv_res.input)
+            staged_wav = (
+                workspace.stage_output(suffix=".wav", prefix="audio-")
+                if workspace is not None
+                else None
+            )
+            if staged_wav is not None:
+                # ffmpeg writes the staging name; the file is published to
+                # its final name only after a complete, non-empty result is
+                # confirmed, so a half-written WAV can never be transcribed.
+                wav_path = staged_wav.part
+            else:
+                wav_handle = workspace_named_temp_file(
+                    suffix=".wav", delete=False, owner=conv_res.input
+                )
+                wav_handle.close()
+                wav_path = Path(wav_handle.name)
 
             try:
                 audio_ok = _extract_audio(video_path, wav_path, runner)
-                if audio_ok and wav_path.exists() and wav_path.stat().st_size > 0:
+                valid_wav = (
+                    audio_ok and wav_path.exists() and wav_path.stat().st_size > 0
+                )
+                if valid_wav and staged_wav is not None:
+                    wav_path = staged_wav.commit()
+                if valid_wav:
                     transcript_items = self._asr_model.transcribe(wav_path)
                     transcript_items = _merge_into_sentences(transcript_items)
                     # Run diarization while WAV is still available
@@ -239,8 +263,9 @@ class VideoPipeline(BasePipeline):
                         video_path.name,
                     )
             finally:
-                if wav_path.exists():
-                    wav_path.unlink()
+                wav_path.unlink(missing_ok=True)
+                if staged_wav is not None:
+                    staged_wav.discard()
 
             # 4. Sample frames
             opts = self.pipeline_options

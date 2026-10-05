@@ -112,6 +112,11 @@ from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
 from docling.pipeline.video_pipeline import VideoPipeline
 from docling.utils.pipeline_cache import create_pipeline_options_hash
 from docling.utils.utils import chunkify
+from docling.utils.workspace import (
+    WorkspaceManager,
+    WorkspaceSettings,
+    workspace_context,
+)
 
 _log = logging.getLogger(__name__)
 _PIPELINE_CACHE_LOCK = threading.Lock()
@@ -445,6 +450,7 @@ class DocumentConverter:
         self,
         allowed_formats: Optional[list[InputFormat]] = None,
         format_options: Optional[dict[InputFormat, FormatOption]] = None,
+        workspace: Optional[WorkspaceSettings] = None,
     ) -> None:
         """Initialize the converter based on format preferences.
 
@@ -452,6 +458,11 @@ class DocumentConverter:
             allowed_formats: List of allowed input formats. By default, any
                 format supported by Docling is allowed.
             format_options: Dictionary of format-specific options.
+            workspace: Configuration of the intermediate-artifacts workspace.
+                When ``None``, the configuration from
+                ``docling.datamodel.settings.settings.workspace`` is used.
+                The workspace is disabled by default, in which case no
+                directory is created and conversion behaves unchanged.
 
         Examples:
             Create a converter with default settings (all formats allowed):
@@ -478,6 +489,13 @@ class DocumentConverter:
         """
         self.allowed_formats: list[InputFormat] = (
             allowed_formats if allowed_formats is not None else list(InputFormat)
+        )
+
+        # Intermediate-artifact lifecycle governance. Constructing the
+        # manager has no filesystem side effects; directories are created
+        # lazily per document and only when the workspace is enabled.
+        self.workspace_manager = WorkspaceManager(
+            workspace if workspace is not None else settings.workspace
         )
 
         # Normalize format options: ensure IMAGE format uses ImageDocumentBackend
@@ -662,7 +680,10 @@ class DocumentConverter:
             page_range=page_range,
         )
         conv_input = _DocumentConversionInput(
-            path_or_stream_iterator=source, limits=limits, headers=headers
+            path_or_stream_iterator=source,
+            limits=limits,
+            headers=headers,
+            workspace_manager=self.workspace_manager,
         )
         conv_res_iter = self._convert(conv_input, raises_on_error=raises_on_error)
 
@@ -839,22 +860,36 @@ class DocumentConverter:
     def _process_document(
         self, in_doc: InputDocument, raises_on_error: bool
     ) -> ConversionResult:
-        valid = (
-            self.allowed_formats is not None and in_doc.format in self.allowed_formats
-        )
-        if valid:
-            conv_res = self._execute_pipeline(in_doc, raises_on_error=raises_on_error)
-        else:
-            error_message = f"File format not allowed: {in_doc.file}"
-            error_item = ErrorItem(
-                component_type=DoclingComponentType.USER_INPUT,
-                module_name="",
-                error_message=error_message,
-                category=FailureCategory.POLICY,
-            )
-            conv_res = ConversionResult(
-                input=in_doc, status=ConversionStatus.SKIPPED, errors=[error_item]
-            )
+        # The workspace (if any) is released on every exit path: success,
+        # reported failure, raised exception, or interruption. Releasing one
+        # document only removes that document's private directory.
+        workspace = in_doc.workspace
+        try:
+            with workspace_context(workspace):
+                valid = (
+                    self.allowed_formats is not None
+                    and in_doc.format in self.allowed_formats
+                )
+                if valid:
+                    conv_res = self._execute_pipeline(
+                        in_doc, raises_on_error=raises_on_error
+                    )
+                else:
+                    error_message = f"File format not allowed: {in_doc.file}"
+                    error_item = ErrorItem(
+                        component_type=DoclingComponentType.USER_INPUT,
+                        module_name="",
+                        error_message=error_message,
+                        category=FailureCategory.POLICY,
+                    )
+                    conv_res = ConversionResult(
+                        input=in_doc,
+                        status=ConversionStatus.SKIPPED,
+                        errors=[error_item],
+                    )
+        finally:
+            if workspace is not None:
+                workspace.release()
 
         return conv_res
 

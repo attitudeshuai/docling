@@ -4,7 +4,6 @@
 import logging
 import shutil
 import sys
-import tempfile
 from io import BytesIO
 from pathlib import Path
 from typing import Final, Protocol
@@ -41,6 +40,7 @@ from docling.datamodel.pipeline_options_asr_model import (
 from docling.pipeline.base_pipeline import BasePipeline
 from docling.utils.accelerator_utils import decide_device
 from docling.utils.profiling import ProfilingScope, TimeRecorder
+from docling.utils.workspace import workspace_materialize
 
 _log = logging.getLogger(__name__)
 
@@ -296,9 +296,9 @@ class _NativeWhisperModel:
         if isinstance(path_or_stream, BytesIO):
             # For BytesIO, write to a temporary file (whisper needs a file path)
             suffix = Path(conv_res.input.file.name).suffix or ".wav"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                tmp_file.write(path_or_stream.getvalue())
-                temp_file_path = Path(tmp_file.name)
+            temp_file_path = workspace_materialize(
+                path_or_stream.getvalue(), suffix=suffix, owner=conv_res.input
+            )
             audio_path = temp_file_path
         elif isinstance(path_or_stream, Path):
             audio_path = path_or_stream
@@ -429,11 +429,11 @@ class _MlxWhisperModel:
         try:
             if isinstance(path_or_stream, BytesIO):
                 suffix = Path(conv_res.input.file.name).suffix or ".wav"
-                with tempfile.NamedTemporaryFile(
-                    delete=False, suffix=suffix
-                ) as tmp_file:
-                    temp_file_path = Path(tmp_file.name)
-                    tmp_file.write(path_or_stream.getvalue())
+                temp_file_path = workspace_materialize(
+                    path_or_stream.getvalue(),
+                    suffix=suffix,
+                    owner=conv_res.input,
+                )
                 audio_path = temp_file_path
             else:
                 audio_path = path_or_stream
@@ -623,9 +623,9 @@ class _WhisperS2TModel:
 
         if isinstance(path_or_stream, BytesIO):
             suffix = Path(conv_res.input.file.name).suffix or ".wav"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                tmp_file.write(path_or_stream.getvalue())
-                temp_file_path = Path(tmp_file.name)
+            temp_file_path = workspace_materialize(
+                path_or_stream.getvalue(), suffix=suffix, owner=conv_res.input
+            )
             audio_path = temp_file_path
         elif isinstance(path_or_stream, Path):
             audio_path = path_or_stream

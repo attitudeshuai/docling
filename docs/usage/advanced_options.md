@@ -66,6 +66,48 @@ export DOCLING_ARTIFACTS_PATH="/local/path/to/models"
 python my_docling_script.py
 ```
 
+## Intermediate-artifacts workspace
+
+Backends (e.g. legacy Office conversion via LibreOffice) and the audio/video
+pipelines need temporary directories and files while converting a document.
+By default these are created directly under the system temporary directory and
+cleaned up individually. Optionally, Docling can govern them through a single
+per-document workspace directory:
+
+- each converted document receives a unique, private subdirectory, and all of
+  its temporary files and directories are created inside it;
+- the subdirectory is removed on success, failure, and interruption alike;
+- directories left behind by an abnormally terminated process are reclaimed the
+  next time a workspace starts (owner PID markers identify leftovers);
+- admission can be gated by a workspace capacity limit and a free-disk-space
+  floor.
+
+The workspace is **disabled by default**, in which case no directory is created
+and behavior is unchanged. Enable it programmatically:
+
+```py
+from docling.document_converter import DocumentConverter
+from docling.utils.workspace import WorkspaceSettings
+
+converter = DocumentConverter(
+    workspace=WorkspaceSettings(
+        enabled=True,
+        root="/tmp/docling-workspace",  # optional: defaults to system temp
+        max_size_bytes=10 * 1024**3,  # optional capacity limit
+        min_free_disk_bytes=1024**3,  # optional free-space floor
+    ),
+)
+```
+
+The same settings are available through environment variables
+(`DOCLING_WORKSPACE_ENABLED`, `DOCLING_WORKSPACE_ROOT`,
+`DOCLING_WORKSPACE_MAX_SIZE_BYTES`, `DOCLING_WORKSPACE_MIN_FREE_DISK_BYTES`,
+`DOCLING_WORKSPACE_LIMIT_POLICY`, `DOCLING_WORKSPACE_STALE_DIR_TTL_SECONDS`).
+
+When a limit is hit, the default policy `fallback` logs a warning and processes
+the document with ordinary system temp files. Set `limit_policy="error"` to
+reject the document with a policy failure instead of admitting it.
+
 ## Using remote services
 
 The main purpose of Docling is to run local models which are not sharing any user data with remote services.

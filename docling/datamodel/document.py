@@ -17,6 +17,7 @@ from pathlib import Path, PurePath
 from typing import (
     TYPE_CHECKING,
     Annotated,
+    Any,
     Literal,
     NamedTuple,
     Optional,
@@ -73,14 +74,20 @@ from docling.datamodel.base_models import (
     MimeTypeToFormat,
     Page,
 )
-from docling.datamodel.settings import DocumentLimits
+from docling.datamodel.settings import DocumentLimits, settings
 from docling.exceptions import DocumentLoadError
 from docling.utils.pdf_outline import _PdfOutlineItem
 from docling.utils.profiling import ProfilingItem
 from docling.utils.utils import create_file_hash, safe_version
+from docling.utils.workspace import (
+    WorkspaceCapacityError,
+    WorkspaceManager,
+    workspace_context,
+)
 
 if TYPE_CHECKING:
     from docling.datamodel.base_models import BaseFormatOption
+    from docling.utils.workspace import DocumentWorkspace
 
 _log = logging.getLogger(__name__)
 
@@ -152,6 +159,9 @@ class InputDocument(BaseModel):
     _backend: AbstractDocumentBackend
     # Reason this input was flagged invalid, if any (transient, not serialized).
     _rejection: Optional[InputRejection] = PrivateAttr(default=None)
+    # Per-document intermediate-artifacts workspace, when workspace
+    # governance is enabled. Transient, never serialized.
+    _workspace: Optional["DocumentWorkspace"] = PrivateAttr(default=None)
 
     def __init__(
         self,
@@ -161,6 +171,7 @@ class InputDocument(BaseModel):
         backend_options: Optional[BackendOptions] = None,
         filename: Optional[str] = None,
         limits: Optional[DocumentLimits] = None,
+        workspace: Optional["DocumentWorkspace"] = None,
     ) -> None:
         super().__init__(
             file="",
@@ -170,6 +181,7 @@ class InputDocument(BaseModel):
         )  # initialize with dummy values
         self.limits = limits or DocumentLimits()
         self.format = format
+        self._workspace = workspace
 
         try:
             if isinstance(path_or_stream, Path):
@@ -290,6 +302,11 @@ class InputDocument(BaseModel):
         doc._rejection = rejection
         return doc
 
+    @property
+    def workspace(self) -> Optional["DocumentWorkspace"]:
+        """Intermediate-artifacts workspace bound to this document, if any."""
+        return self._workspace
+
     def _reject_filesize(self) -> None:
         self.valid = False
         self._rejection = InputRejection(
@@ -306,14 +323,18 @@ class InputDocument(BaseModel):
         path_or_stream: Union[BytesIO, Path],
     ) -> None:
         try:
-            if self.backend_options:
-                self._backend = backend(
-                    self,
-                    path_or_stream=path_or_stream,
-                    options=self.backend_options,
-                )
-            else:
-                self._backend = backend(self, path_or_stream=path_or_stream)
+            # The backend can allocate intermediate artifacts (e.g. legacy
+            # Office conversion via LibreOffice) during construction; make
+            # the document workspace reachable on the constructing thread.
+            with workspace_context(self._workspace):
+                if self.backend_options:
+                    self._backend = backend(
+                        self,
+                        path_or_stream=path_or_stream,
+                        options=self.backend_options,
+                    )
+                else:
+                    self._backend = backend(self, path_or_stream=path_or_stream)
         except Exception as exc:
             # A DocumentLoadError (bad input bytes) is recorded as a
             # BACKEND_FAILURE rejection, like the is_valid() branch below.
@@ -620,6 +641,17 @@ class _DocumentConversionInput(BaseModel):
     path_or_stream_iterator: Iterable[Union[Path, str, DocumentStream, HttpSource]]
     headers: Optional[dict[str, str]] = None
     limits: Optional[DocumentLimits] = DocumentLimits()
+    # Workspace manager supplied by the owning converter. Not serialized; when
+    # unset, a manager is built lazily from the global settings (None when
+    # workspace governance is disabled, the default).
+    workspace_manager: Optional[Any] = Field(default=None, exclude=True)
+
+    def _resolve_workspace_manager(self) -> Optional[WorkspaceManager]:
+        if self.workspace_manager is not None:
+            return self.workspace_manager
+        if not settings.workspace.enabled:
+            return None
+        return WorkspaceManager(settings.workspace)
 
     def docs(
         self,
@@ -701,6 +733,38 @@ class _DocumentConversionInput(BaseModel):
             else:
                 raise RuntimeError(f"Unexpected obj type in iterator: {type(obj)}")
 
+            doc_workspace: Optional[DocumentWorkspace] = None
+            workspace_manager = self._resolve_workspace_manager()
+            if workspace_manager is not None:
+                estimated_bytes = self._estimate_input_size(obj)
+                try:
+                    doc_workspace = workspace_manager.acquire(
+                        doc_name=obj.name, estimated_bytes=estimated_bytes
+                    )
+                except WorkspaceCapacityError as exc:
+                    # ERROR policy: the document is rejected before any
+                    # backend runs; FALLBACK is handled inside acquire().
+                    _log.warning(
+                        "Rejecting %s: intermediate-artifacts workspace limits "
+                        "are exceeded and the limit policy is ERROR: %s",
+                        obj.name,
+                        exc,
+                    )
+                    yield self._build_invalid_input_document(
+                        name=obj.name,
+                        format_options=format_options,
+                        file_size=estimated_bytes,
+                        rejection=InputRejection(
+                            message=(
+                                "Intermediate-artifacts workspace limits are "
+                                f"exceeded: {exc}"
+                            ),
+                            category=FailureCategory.POLICY,
+                            original_error=exc,
+                        ),
+                    )
+                    continue
+
             yield InputDocument(
                 path_or_stream=path_or_stream,
                 format=format,  # type: ignore[arg-type]
@@ -708,7 +772,17 @@ class _DocumentConversionInput(BaseModel):
                 limits=self.limits,
                 backend=backend,
                 backend_options=backend_options,
+                workspace=doc_workspace,
             )
+
+    @staticmethod
+    def _estimate_input_size(obj: Union[Path, DocumentStream]) -> int:
+        if isinstance(obj, Path):
+            try:
+                return obj.stat().st_size
+            except OSError:
+                return 0
+        return obj.stream.getbuffer().nbytes
 
     def _build_invalid_input_document(
         self,

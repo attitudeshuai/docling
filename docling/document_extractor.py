@@ -44,6 +44,11 @@ from docling.pipeline.base_extraction_pipeline import BaseExtractionPipeline
 from docling.pipeline.extraction_vlm_pipeline import ExtractionVlmPipeline
 from docling.utils.pipeline_cache import create_pipeline_options_hash
 from docling.utils.utils import chunkify
+from docling.utils.workspace import (
+    WorkspaceManager,
+    WorkspaceSettings,
+    workspace_context,
+)
 
 _log = logging.getLogger(__name__)
 _PIPELINE_CACHE_LOCK = threading.Lock()
@@ -108,9 +113,15 @@ class DocumentExtractor:
         extraction_format_options: Optional[
             dict[InputFormat, ExtractionFormatOption]
         ] = None,
+        workspace: Optional[WorkspaceSettings] = None,
     ) -> None:
         self.allowed_formats: list[InputFormat] = (
             allowed_formats if allowed_formats is not None else list(InputFormat)
+        )
+        # Intermediate-artifact lifecycle governance; no directory is
+        # created while the workspace is disabled (the default).
+        self.workspace_manager = WorkspaceManager(
+            workspace if workspace is not None else settings.workspace
         )
         # Build per-format options with defaults, then apply any user overrides
         overrides = extraction_format_options or {}
@@ -165,7 +176,10 @@ class DocumentExtractor:
             page_range=page_range,
         )
         conv_input = _DocumentConversionInput(
-            path_or_stream_iterator=source, limits=limits, headers=headers
+            path_or_stream_iterator=source,
+            limits=limits,
+            headers=headers,
+            workspace_manager=self.workspace_manager,
         )
 
         ext_res_iter = self._extract(
@@ -245,24 +259,39 @@ class DocumentExtractor:
         raises_on_error: bool,
         template: ExtractionTemplateType,
     ) -> ExtractionResult:
-        valid = (
-            self.allowed_formats is not None and in_doc.format in self.allowed_formats
-        )
-        if valid:
-            return self._execute_extraction_pipeline(
-                in_doc, raises_on_error=raises_on_error, template=template
-            )
-        else:
-            error_message = f"File format not allowed: {in_doc.file}"
-            error_item = ErrorItem(
-                component_type=DoclingComponentType.USER_INPUT,
-                module_name="",
-                error_message=error_message,
-                category=FailureCategory.POLICY,
-            )
-            return ExtractionResult(
-                input=in_doc, status=ConversionStatus.SKIPPED, errors=[error_item]
-            )
+        # Same lifecycle guarantees as the converter: workspace
+        # active on the worker thread and released on every path.
+        workspace = in_doc.workspace
+        try:
+            with workspace_context(workspace):
+                valid = (
+                    self.allowed_formats is not None
+                    and in_doc.format in self.allowed_formats
+                )
+                if valid:
+                    extraction_result = self._execute_extraction_pipeline(
+                        in_doc,
+                        raises_on_error=raises_on_error,
+                        template=template,
+                    )
+                else:
+                    error_message = f"File format not allowed: {in_doc.file}"
+                    error_item = ErrorItem(
+                        component_type=DoclingComponentType.USER_INPUT,
+                        module_name="",
+                        error_message=error_message,
+                        category=FailureCategory.POLICY,
+                    )
+                    extraction_result = ExtractionResult(
+                        input=in_doc,
+                        status=ConversionStatus.SKIPPED,
+                        errors=[error_item],
+                    )
+        finally:
+            if workspace is not None:
+                workspace.release()
+
+        return extraction_result
 
     def _execute_extraction_pipeline(
         self,

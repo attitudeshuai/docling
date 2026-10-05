@@ -38,6 +38,11 @@ layer = "foundation"
 depends_on = []
 
 [[modules]]
+path = "docling.utils.workspace"
+layer = "foundation"
+depends_on = []
+
+[[modules]]
 path = "docling.backend"
 layer = "core"
 depends_on = [
@@ -47,12 +52,13 @@ depends_on = [
   "docling.datamodel.backend_options",
   "docling.exceptions",
   "docling.utils",
+  "docling.utils.workspace",
 ]
 
 [[modules]]
 path = "docling.backend.docx"
 layer = "core"
-depends_on = []
+depends_on = ["docling.utils.workspace"]
 
 [[modules]]
 path = "docling.backend.json"
@@ -66,6 +72,7 @@ depends_on = [
   "docling.backend",
   "docling.datamodel",
   "docling.datamodel.backend_options",
+  "docling.utils.workspace",
 ]
 
 [[modules]]
@@ -76,6 +83,7 @@ depends_on = [
   "docling.datamodel",
   "docling.datamodel.backend_options",
   "docling.exceptions",
+  "docling.utils.workspace",
 ]
 
 [[modules]]
@@ -97,6 +105,7 @@ depends_on = [
   "docling.models.utils",
   "docling.utils",
   "docling.utils.ocr_language",
+  "docling.utils.workspace",
 ]
 
 [[modules]]
@@ -317,6 +326,7 @@ depends_on = [
   "docling.models.inference_engines.common",
   "docling.utils",
   "docling.utils.ocr_language",
+  "docling.utils.workspace",
 ]
 
 [[modules]]
@@ -466,6 +476,7 @@ depends_on = [
   "docling.datamodel.pipeline_options_asr_model",
   "docling.pipeline.base_pipeline",
   "docling.utils",
+  "docling.utils.workspace",
 ]
 
 [[modules]]
@@ -490,6 +501,7 @@ depends_on = [
   "docling.pipeline.asr_transcriber",
   "docling.pipeline.base_pipeline",
   "docling.utils",
+  "docling.utils.workspace",
 ]
 
 [[modules]]
@@ -572,6 +584,7 @@ depends_on = [
   "docling.pipeline.simple_pipeline",
   "docling.pipeline.standard_pdf_pipeline",
   "docling.utils",
+  "docling.utils.workspace",
 ]
 
 [[modules]]
@@ -585,6 +598,7 @@ depends_on = [
   "docling.pipeline.base_extraction_pipeline",
   "docling.pipeline.extraction_vlm_pipeline",
   "docling.utils",
+  "docling.utils.workspace",
 ]
 
 [[modules]]

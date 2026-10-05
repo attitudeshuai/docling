@@ -12,10 +12,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
-from tempfile import mkdtemp
 from typing import TYPE_CHECKING, Callable, Final, Optional
 
 from PIL import Image, ImageChops
+
+from docling.utils.workspace import workspace_mkdtemp
 
 if TYPE_CHECKING:
     from docx.document import Document
@@ -246,7 +247,7 @@ def _isolated_libreoffice_profile() -> Iterator[str]:
         ``registrymodifications.xcu``. The directory is removed again
         once the ``with`` block exits.
     """
-    profile_dir = Path(mkdtemp(prefix="docling_lo_profile_"))
+    profile_dir = workspace_mkdtemp(prefix="docling_lo_profile_")
     try:
         user_dir = profile_dir / "user"
         user_dir.mkdir(parents=True, exist_ok=True)
@@ -296,7 +297,7 @@ def convert_to_modern_format(
             f".{target_suffix}. Install LibreOffice and make sure it is on PATH."
         )
 
-    tmp_dir = Path(mkdtemp())
+    tmp_dir = workspace_mkdtemp()
     try:
         if isinstance(source, BytesIO):
             source.seek(0)
@@ -416,7 +417,7 @@ def get_pil_from_dml_docx(
     if converter is None:
         return None
 
-    temp_dir = Path(mkdtemp())
+    temp_dir = workspace_mkdtemp()
     try:
         temp_docx = Path(temp_dir / "drawing_only.docx")
         temp_pdf = Path(temp_dir / "drawing_only.pdf")

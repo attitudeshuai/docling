@@ -12,14 +12,14 @@ from docling.backend.docx.drawingml import utils as drawingml_utils
 
 def _track_mkdtemp(monkeypatch) -> list[Path]:
     created_dirs: list[Path] = []
-    real_mkdtemp = drawingml_utils.mkdtemp
+    real_mkdtemp = drawingml_utils.workspace_mkdtemp
 
     def tracking_mkdtemp(*args, **kwargs):
         path = real_mkdtemp(*args, **kwargs)
         created_dirs.append(Path(path))
         return path
 
-    monkeypatch.setattr(drawingml_utils, "mkdtemp", tracking_mkdtemp)
+    monkeypatch.setattr(drawingml_utils, "workspace_mkdtemp", tracking_mkdtemp)
     return created_dirs
 
 

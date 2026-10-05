@@ -3,7 +3,6 @@
 
 import logging
 import sys
-import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Optional, Type
@@ -27,6 +26,7 @@ from docling.utils.ocr_language import (
     OcrLanguageSupport,
 )
 from docling.utils.profiling import TimeRecorder
+from docling.utils.workspace import workspace_named_temp_file
 
 _log = logging.getLogger(__name__)
 
@@ -172,8 +172,10 @@ class OcrMacModel(BaseOcrModel):
                             scale=self.scale, cropbox=ocr_rect
                         )
 
-                        with tempfile.NamedTemporaryFile(
-                            suffix=".png", mode="w"
+                        with workspace_named_temp_file(
+                            suffix=".png",
+                            mode="w",
+                            owner=conv_res.input,
                         ) as image_file:
                             fname = image_file.name
                             high_res_image.save(fname)
